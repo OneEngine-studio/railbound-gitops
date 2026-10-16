@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nakama-placeholder
+  namespace: nakama-system
+data:
+  initialized: "true"
