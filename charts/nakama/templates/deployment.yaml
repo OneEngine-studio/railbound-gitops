@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nakama.fullname" . }}
+  labels:
+    {{- include "nakama.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "nakama.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nakama.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        {{- if .Values.initContainers.waitForDatabase.enabled }}
+        - name: wait-for-database
+          image: {{ .Values.initContainers.waitForDatabase.image }}
+          command:
+            - "/bin/sh"
+            - "-c"
+            - |
+              echo "Waiting for database at {{ .Values.database.host }}:{{ .Values.database.port }}..."
+              for i in $(seq 1 {{ .Values.initContainers.waitForDatabase.timeoutSeconds }}); do
+                nc -z -w 2 {{ .Values.database.host }} {{ .Values.database.port }} && echo "Database reachable!" && exit 0
+                echo "Database not ready yet... sleeping 2s ($i)"
+                sleep 2
+              done
+              echo "Timed out waiting for database."
+              exit 1
+        {{- end }}
+        - name: nakama-migration
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - "/bin/sh"
+            - "-ecx"
+            - |
+              /nakama/nakama migrate up --database.address {{ include "nakama.databaseAddress" . | quote }}
+      containers:
+        - name: nakama
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - "/bin/sh"
+            - "-ecx"
+            - |
+              exec /nakama/nakama --config /nakama/config/nakama-config.yml
+          ports:
+            - name: http
+              containerPort: {{ .Values.socket.port }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ .Values.grpc.port }}
+              protocol: TCP
+            {{- if .Values.console.enabled }}
+            - name: console
+              containerPort: {{ .Values.console.port }}
+              protocol: TCP
+            - name: console-grpc
+              containerPort: {{ .Values.console.grpcPort }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.prometheusPort }}
+              protocol: TCP
+            {{- end }}
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /nakama/config
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "nakama.fullname" . }}-config
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+

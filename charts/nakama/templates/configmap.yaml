@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nakama.fullname" . }}-config
+  labels:
+    {{- include "nakama.labels" . | nindent 4 }}
+data:
+  nakama-config.yml: |
+    name: {{ .Values.server.name }}
+    data_dir: {{ .Values.server.dataDir }}
+
+    logger:
+      stdout: {{ .Values.logger.stdout }}
+      level: {{ .Values.logger.level | quote }}
+      format: {{ .Values.logger.format | quote }}
+
+    database:
+      address:
+        - {{ include "nakama.databaseAddress" . | quote }}
+      conn_max_lifetime_ms: {{ .Values.database.connMaxLifetimeMs }}
+      max_open_conns: {{ .Values.database.maxOpenConns }}
+      max_idle_conns: {{ .Values.database.maxIdleConns }}
+
+    socket:
+      port: {{ .Values.socket.port }}
+      server_key: {{ .Values.server.key | quote }}
+      max_message_size_bytes: {{ .Values.socket.maxMessageSizeBytes }}
+      outgoing_queue_size: {{ .Values.socket.outgoingQueueSize }}
+      ping_period_ms: {{ .Values.socket.pingPeriodMs }}
+      pong_wait_ms: {{ .Values.socket.pongWaitMs }}
+      write_wait_ms: {{ .Values.socket.writeWaitMs }}
+      read_timeout_ms: {{ .Values.socket.readTimeoutMs }}
+
+    session:
+      encryption_key: {{ .Values.session.encryptionKey | quote }}
+      token_expiry_sec: {{ .Values.session.tokenExpirySec }}
+
+    runtime:
+      http_key: {{ .Values.runtime.httpKey | quote }}
+      path: {{ .Values.runtime.path | quote }}
+
+    matchmaker:
+      interval_sec: {{ .Values.matchmaker.intervalSec }}
+      max_intervals: {{ .Values.matchmaker.maxIntervals }}
+      max_tickets: {{ .Values.matchmaker.maxTickets }}
+
+    {{- if .Values.console.enabled }}
+    console:
+      port: {{ .Values.console.port }}
+      username: {{ .Values.console.username | quote }}
+      password: {{ .Values.console.password | quote }}
+      signing_key: {{ .Values.console.signingKey | quote }}
+    {{- end }}
+
+    {{- if .Values.metrics.enabled }}
+    metrics:
+      reporting_freq_sec: {{ .Values.metrics.reportingFreqSec }}
+      namespace: {{ .Values.metrics.namespace | quote }}
+      prometheus_port: {{ .Values.metrics.prometheusPort }}
+    {{- end }}
+

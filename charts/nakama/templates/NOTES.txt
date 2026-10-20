@@ -1,0 +1,30 @@
+1. Get the Nakama Game Server application URL by running these commands:
+{{- if .Values.ingress.enabled }}
+{{- range $host := .Values.ingress.hosts }}
+  Client API: http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host.host }}
+{{- end }}
+{{- if .Values.ingress.consoleHost.enabled }}
+  Server Manager Console: http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .Values.ingress.consoleHost.host }}
+{{- end }}
+{{- else if contains "NodePort" .Values.service.type }}
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  export NODE_PORT_HTTP=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[?(@.name=='http')].nodePort}" services {{ include "nakama.fullname" . }})
+  export NODE_PORT_CONSOLE=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[?(@.name=='console')].nodePort}" services {{ include "nakama.fullname" . }})
+  echo Nakama HTTP/WebSocket: http://$NODE_IP:$NODE_PORT_HTTP
+  echo Nakama Console Manager: http://$NODE_IP:$NODE_PORT_CONSOLE
+{{- else if contains "LoadBalancer" .Values.service.type }}
+  NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+        You can watch the status of by running 'kubectl get --namespace {{ .Release.Namespace }} svc -w {{ include "nakama.fullname" . }}'
+  export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "nakama.fullname" . }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
+  echo Nakama HTTP/WebSocket: http://$SERVICE_IP:{{ .Values.service.ports.http }}
+  echo Nakama Console Manager: http://$SERVICE_IP:{{ .Values.service.ports.console }}
+{{- else if contains "ClusterIP" .Values.service.type }}
+  # Forward ports to your local machine:
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "nakama.fullname" . }} {{ .Values.service.ports.http }}:{{ .Values.service.ports.http }} &
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "nakama.fullname" . }} {{ .Values.service.ports.console }}:{{ .Values.service.ports.console }} &
+
+  echo "Nakama Game Server API: http://127.0.0.1:{{ .Values.service.ports.http }}"
+  echo "Nakama Server Manager Console: http://127.0.0.1:{{ .Values.service.ports.console }}"
+  echo "Default Console Credentials: Username: '{{ .Values.console.username }}' | Password: '{{ .Values.console.password }}'"
+{{- end }}
+

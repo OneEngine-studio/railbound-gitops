@@ -1,0 +1,14 @@
+apiVersion: v2
+name: nakama
+description: Helm chart for Heroic Labs Nakama Game Server and Server Console Manager
+type: application
+version: 0.1.0
+appVersion: "3.22.0"
+keywords:
+  - nakama
+  - game-server
+  - multiplayer
+  - gaming
+  - matchmaking
+  - heroiclabs
+

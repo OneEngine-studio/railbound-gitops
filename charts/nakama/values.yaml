@@ -1,0 +1,133 @@
+# Default values for nakama game server & manager.
+# This is a YAML-formatted file.
+
+replicaCount: 1
+
+image:
+  repository: heroiclabs/nakama
+  pullPolicy: IfNotPresent
+  tag: "3.22.0"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: "nakama"
+
+# Database connection configuration (CockroachDB / PostgreSQL)
+database:
+  type: cockroachdb
+  host: cockroachdb.platform.svc.cluster.local
+  port: 26257
+  username: root
+  password: ""
+  name: nakama
+  sslMode: disable
+  maxOpenConns: 100
+  maxIdleConns: 100
+  connMaxLifetimeMs: 0
+
+# Core server & runtime configuration
+server:
+  name: "nakama-node"
+  dataDir: "/nakama/data"
+  key: "defaultkey"
+
+# Client socket configuration
+socket:
+  port: 7350
+  maxMessageSizeBytes: 4096
+  outgoingQueueSize: 64
+  pingPeriodMs: 15000
+  pongWaitMs: 25000
+  writeWaitMs: 5000
+  readTimeoutMs: 10000
+
+# Client gRPC configuration
+grpc:
+  port: 7349
+
+# Nakama Console (Web Server Manager Dashboard)
+console:
+  enabled: true
+  port: 7351
+  grpcPort: 7348
+  username: "admin"
+  password: "password"
+  signingKey: "defaultsigningkey"
+
+# Session tokens
+session:
+  encryptionKey: "defaultencryptionkey"
+  tokenExpirySec: 7200
+
+# Runtime HTTP API Key
+runtime:
+  httpKey: "defaulthttpkey"
+  path: "/nakama/data/modules"
+
+# Matchmaker settings
+matchmaker:
+  intervalSec: 15
+  maxIntervals: 2
+  maxTickets: 3
+
+# Prometheus metrics
+metrics:
+  enabled: true
+  prometheusPort: 9090
+  reportingFreqSec: 60
+  namespace: "nakama"
+
+# Logger configuration
+logger:
+  level: "info"
+  format: "json"
+  stdout: true
+
+# Database init container (waits for database availability before migrations)
+initContainers:
+  waitForDatabase:
+    enabled: true
+    image: busybox:1.36
+    timeoutSeconds: 120
+
+# Kubernetes Service configuration
+service:
+  type: ClusterIP
+  ports:
+    http: 7350
+    grpc: 7349
+    console: 7351
+    metrics: 9090
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: nakama.local
+      paths:
+        - path: /
+          pathType: Prefix
+          port: 7350
+  consoleHost:
+    enabled: false
+    host: nakama-console.local
+    paths:
+      - path: /
+        pathType: Prefix
+        port: 7351
+  tls: []
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 2048Mi
+  requests:
+    cpu: 250m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+

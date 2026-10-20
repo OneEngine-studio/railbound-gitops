@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cockroachdb.fullname" . }}
+  labels:
+    {{- include "cockroachdb.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.sqlPort }}
+      targetPort: sql
+      name: sql
+      protocol: TCP
+    - port: {{ .Values.service.httpPort }}
+      targetPort: http
+      name: http
+      protocol: TCP
+  selector:
+    {{- include "cockroachdb.selectorLabels" . | nindent 4 }}
+

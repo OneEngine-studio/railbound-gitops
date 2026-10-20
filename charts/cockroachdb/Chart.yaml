@@ -1,0 +1,13 @@
+apiVersion: v2
+name: cockroachdb
+description: CockroachDB distributed database chart for Nakama game server data tier
+type: application
+version: 0.1.0
+appVersion: "24.1.0"
+keywords:
+  - database
+  - cockroachdb
+  - sql
+  - nakama
+  - gaming
+

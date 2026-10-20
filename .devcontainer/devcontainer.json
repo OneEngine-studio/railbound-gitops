@@ -31,5 +31,5 @@
       }
     }
   },
-  "postCreateCommand": "helm repo add heroiclabs https://heroiclabs.github.io/helm-charts && helm repo update"
+  "postCreateCommand": "helm repo add cockroachdb https://charts.cockroachdb.com/ && helm repo update"
 }

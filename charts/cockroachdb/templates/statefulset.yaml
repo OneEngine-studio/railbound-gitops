@@ -1,0 +1,98 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "cockroachdb.fullname" . }}
+  labels:
+    {{- include "cockroachdb.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "cockroachdb.fullname" . }}
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "cockroachdb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cockroachdb.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: cockroachdb
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - "/bin/bash"
+            - "-ecx"
+            - |
+              exec /cockroach/cockroach start-single-node \
+              {{- if .Values.conf.insecure }}
+              --insecure \
+              {{- end }}
+              --http-port={{ .Values.conf.httpPort }} \
+              --port={{ .Values.conf.sqlPort }} \
+              --cache={{ .Values.conf.cache }} \
+              --max-sql-memory={{ .Values.conf.maxSqlMemory }} \
+              --store=attrs=ssd,path=/cockroach/cockroach-data \
+              {{- range .Values.conf.extraArgs }}
+              {{ . }} \
+              {{- end }}
+          ports:
+            - name: sql
+              containerPort: {{ .Values.conf.sqlPort }}
+              protocol: TCP
+            - name: http
+              containerPort: {{ .Values.conf.httpPort }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: "/health?ready=1"
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: "/health"
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: datadir
+              mountPath: /cockroach/cockroach-data
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: datadir
+      spec:
+        accessModes:
+          - {{ .Values.persistence.accessMode | quote }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size | quote }}
+  {{- else }}
+      volumes:
+        - name: datadir
+          emptyDir: {}
+  {{- end }}
+

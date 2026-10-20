@@ -1,0 +1,53 @@
+# Default values for cockroachdb.
+# This is a YAML-formatted file.
+
+replicaCount: 1
+
+image:
+  repository: cockroachdb/cockroach
+  pullPolicy: IfNotPresent
+  tag: "v24.1.0"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: "cockroachdb"
+
+conf:
+  # Cluster name identifier
+  clusterName: "railbound-db"
+  # Set to true for local development / non-production clusters
+  insecure: true
+  # SQL client port
+  sqlPort: 26257
+  # Web Admin UI / HTTP status port
+  httpPort: 8080
+  # Max cache size (e.g. 25%)
+  cache: "25%"
+  # Max memory allocated to temporary SQL data (e.g. 25%)
+  maxSqlMemory: "25%"
+  # Additional arguments passed to cockroach start
+  extraArgs: []
+
+service:
+  type: ClusterIP
+  sqlPort: 26257
+  httpPort: 8080
+
+persistence:
+  enabled: true
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  storageClassName: ""
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 2048Mi
+  requests:
+    cpu: 250m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
