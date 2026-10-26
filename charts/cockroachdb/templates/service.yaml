@@ -17,4 +17,3 @@ spec:
       protocol: TCP
   selector:
     {{- include "cockroachdb.selectorLabels" . | nindent 4 }}
-
