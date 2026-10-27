@@ -5,28 +5,30 @@ metadata:
   labels:
     {{- include "nakama.labels" . | nindent 4 }}
 spec:
-  type: {{ .Values.service.type }}
+  type: {{ .Values.service.type | default "ClusterIP" }}
   ports:
     - name: http
       port: {{ .Values.service.ports.http }}
       targetPort: http
       protocol: TCP
+      appProtocol: http
     - name: grpc
       port: {{ .Values.service.ports.grpc }}
       targetPort: grpc
       protocol: TCP
-    {{- if .Values.console.enabled }}
+      appProtocol: grpc
+{{- if .Values.console.enabled }}
     - name: console
       port: {{ .Values.service.ports.console }}
       targetPort: console
       protocol: TCP
-    {{- end }}
-    {{- if .Values.metrics.enabled }}
+      appProtocol: http
+{{- end }}
+{{- if .Values.metrics.enabled }}
     - name: metrics
       port: {{ .Values.service.ports.metrics }}
       targetPort: metrics
       protocol: TCP
-    {{- end }}
+{{- end }}
   selector:
     {{- include "nakama.selectorLabels" . | nindent 4 }}
-
