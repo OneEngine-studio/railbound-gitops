@@ -1,13 +1,16 @@
 {
   "name": "Helm & GitOps Environment",
-  "image": "mcr.microsoft.com/devcontainers/base:bullseye",
+  "image": "<unsafe_url>mcr.microsoft.com/devcontainers/base:bullseye</unsafe_url>",
   "features": {
-    "ghcr.io/devcontainers/features/kubectl-helm-minikube:1": {
+    "<unsafe_url>ghcr.io/devcontainers/features/kubectl-helm-minikube:1</unsafe_url>": {
       "version": "latest",
       "helm": "latest",
       "minikube": "none"
     },
-    "ghcr.io/devcontainers/features/git:1": {
+    "<unsafe_url>ghcr.io/devcontainers/features/git:1</unsafe_url>": {
+      "version": "latest"
+    },
+    "<unsafe_url>ghcr.io/devcontainers/features/kustomize:1</unsafe_url>": {
       "version": "latest"
     }
   },
@@ -16,7 +19,8 @@
       "extensions": [
         "ms-kubernetes-tools.vscode-kubernetes-tools",
         "tim-koehler.helm-intellisense",
-        "redhat.vscode-yaml"
+        "redhat.vscode-yaml",
+        "weaveworks.vscode-gitops-tools"
       ],
       "settings": {
         "yaml.schemas": {
@@ -31,5 +35,5 @@
       }
     }
   },
-  "postCreateCommand": "helm repo add cockroachdb https://charts.cockroachdb.com/ && helm repo update"
+  "updateContentCommand": "helm repo add cockroachdb https://charts.cockroachdb.com/ && helm repo update"
 }
