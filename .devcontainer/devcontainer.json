@@ -1,16 +1,22 @@
 {
   "name": "Helm & GitOps Environment",
-  "image": "<unsafe_url>mcr.microsoft.com/devcontainers/base:bullseye</unsafe_url>",
+  "image": "<unsafe_url>mcr.microsoft.com/devcontainers/base:bookworm</unsafe_url>",
   "features": {
-    "<unsafe_url>ghcr.io/devcontainers/features/kubectl-helm-minikube:1</unsafe_url>": {
+    "<unsafe_url>ghcr.io/devcontainers/features/kubectl-helm-minikube:2</unsafe_url>": {
       "version": "latest",
       "helm": "latest",
       "minikube": "none"
     },
-    "<unsafe_url>ghcr.io/devcontainers/features/git:1</unsafe_url>": {
+    "<unsafe_url>ghcr.io/devcontainers/features/git:2</unsafe_url>": {
       "version": "latest"
     },
-    "<unsafe_url>ghcr.io/devcontainers/features/kustomize:1</unsafe_url>": {
+    "<unsafe_url>ghcr.io/devcontainers/features/kustomize:2</unsafe_url>": {
+      "version": "latest"
+    },
+    "<unsafe_url>ghcr.io/devcontainers/features/github-cli:1</unsafe_url>": {
+      "version": "latest"
+    },
+    "<unsafe_url>ghcr.io/devcontainers/features/flux:1</unsafe_url>": {
       "version": "latest"
     }
   },
@@ -20,7 +26,9 @@
         "ms-kubernetes-tools.vscode-kubernetes-tools",
         "tim-koehler.helm-intellisense",
         "redhat.vscode-yaml",
-        "weaveworks.vscode-gitops-tools"
+        "weaveworks.vscode-gitops-tools",
+        "argoproj.argo-cd-vscode",
+        "github.vscode-github-actions"
       ],
       "settings": {
         "yaml.schemas": {
@@ -35,5 +43,5 @@
       }
     }
   },
-  "updateContentCommand": "helm repo add cockroachdb https://charts.cockroachdb.com/ && helm repo update"
+  "postCreateCommand": "helm repo add cockroachdb https://charts.cockroachdb.com/ && helm repo update"
 }
