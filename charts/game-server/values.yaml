@@ -3,7 +3,7 @@ replicaCount: 1
 
 image:
   repository: kushanrandika/railbound-server
-  pullPolicy: Always
+  pullPolicy: IfNotPresent
   tag: "latest"
 
 imagePullSecrets: []
