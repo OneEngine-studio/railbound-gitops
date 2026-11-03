@@ -1,0 +1,25 @@
+{{- if .Values.agones.enabled }}
+apiVersion: "agones.dev/v1"
+kind: GameServer
+metadata:
+  name: {{ include "game-server.fullname" . }}
+  labels:
+    {{- include "game-server.labels" . | nindent 4 }}
+spec:
+  ports:
+    - name: game
+      portPolicy: Dynamic
+      containerPort: {{ .Values.agones.containerPort }}
+      protocol: UDP
+  template:
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: UNITY_SERVER
+              value: "1"
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+{{- end }}

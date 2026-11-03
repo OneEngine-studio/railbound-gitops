@@ -1,0 +1,55 @@
+{{- if not .Values.agones.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "game-server.fullname" . }}
+  labels:
+    {{- include "game-server.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "game-server.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "game-server.selectorLabels" . | nindent 8 }}
+      annotations:
+        public-ip: {{ .Values.game.publicIP | quote }}
+        wireguard-gateway: {{ .Values.game.wireguardGateway | quote }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: game
+              containerPort: {{ .Values.game.port }}
+              hostPort: {{ .Values.game.hostPort }}
+              protocol: {{ .Values.game.protocol }}
+          env:
+            - name: UNITY_SERVER
+              value: "1"
+            - name: PUBLIC_IP
+              value: {{ .Values.game.publicIP | quote }}
+            - name: PORT
+              value: {{ .Values.game.port | quote }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

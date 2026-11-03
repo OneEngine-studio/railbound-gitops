@@ -1,0 +1,8 @@
+apiVersion: v2
+name: game-server
+description: Railbound Netcode Dedicated Game Server on k3s with Agones & WireGuard public ingress
+type: application
+version: 0.1.0
+appVersion: "latest"
+maintainers:
+  - name: OneEngine Studio

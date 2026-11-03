@@ -1,0 +1,43 @@
+# Default values for game-server.
+replicaCount: 1
+
+image:
+  repository: kushanrandika/railbound-server
+  pullPolicy: Always
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Network & Game Port Settings
+game:
+  port: 7777
+  protocol: UDP
+  hostPort: 7777
+  # Public Ingress routing via Oracle Cloud WireGuard bridge
+  publicIP: "134.185.84.226"
+  wireguardGateway: "10.8.0.1"
+  localServerIP: "10.8.0.2"
+
+service:
+  type: ClusterIP
+  port: 7777
+  protocol: UDP
+
+# Optional Agones CRD integration
+agones:
+  enabled: false
+  containerPort: 7777
+
+resources:
+  limits:
+    cpu: 2000m
+    memory: 2048Mi
+  requests:
+    cpu: 500m
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
