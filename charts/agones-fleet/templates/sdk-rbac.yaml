@@ -1,0 +1,27 @@
+# Agones injects the SDK sidecar into every game server pod and runs it as the service account "agones-sdk" of the pod's own
+# namespace. The Agones Helm chart only creates that account for the namespaces listed in gameservers.namespaces (default:
+# "default" only), so without this file the GameServers in this namespace end in state Error:
+#   error looking up service account platform/agones-sdk: serviceaccount "agones-sdk" not found
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agones-sdk
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agones-sdk-access
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: agones-sdk
+subjects:
+  - kind: ServiceAccount
+    name: agones-sdk
+    namespace: {{ .Release.Namespace }}
