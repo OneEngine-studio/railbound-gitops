@@ -1,0 +1,50 @@
+# Railbound Battle Royale Agones Fleet.
+#
+# Every GameServer is one Unity dedicated server (one match). The Nakama RPC "railbound_allocate" allocates a Ready server
+# per match; when the match ends the server calls the Agones SDK /shutdown and the fleet starts a fresh one.
+
+fleetName: railbound-br
+
+image:
+  repository: kushanrandika/railbound-server
+  # the CI bumps this tag on every server build
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+game:
+  # port the Unity server listens on INSIDE the container (the Dockerfile starts it with -port 7777).
+  # Agones maps a free host port from its dynamic range (7000-8000) to it.
+  containerPort: 7777
+
+fleet:
+  # Used when the autoscaler is disabled. With the autoscaler on, the autoscaler owns the replica count.
+  # Starts at 0 on purpose: the server image must contain AgonesServerLifecycle (it reports /ready and /health)
+  # before servers are started, otherwise they are restarted in a loop. Build the image from the Unity branch first
+  # (the CI bumps `image.tag`), then enable the autoscaler below.
+  replicas: 0
+
+autoscaler:
+  enabled: false
+  # keep this many Ready (idle) servers available for the next matches
+  bufferSize: 2
+  minReplicas: 2
+  maxReplicas: 8
+
+health:
+  # the Unity server must report /ready by then and ping /health continuously
+  initialDelaySeconds: 60
+  periodSeconds: 5
+  failureThreshold: 6
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 768Mi
+  limits:
+    cpu: 2000m
+    memory: 2048Mi
+
+nodeSelector: {}
+tolerations: []

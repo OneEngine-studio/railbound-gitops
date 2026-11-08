@@ -15,7 +15,13 @@ spec:
         {{- include "nakama.selectorLabels" . | nindent 8 }}
       annotations:
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.agones.enabled }}
+        checksum/modules: {{ include (print $.Template.BasePath "/modules-configmap.yaml") . | sha256sum }}
+        {{- end }}
     spec:
+      {{- if .Values.agones.enabled }}
+      serviceAccountName: {{ include "nakama.fullname" . }}
+      {{- end }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -94,10 +100,32 @@ spec:
             - name: config
               mountPath: /nakama/config
               readOnly: true
+            {{- if .Values.agones.enabled }}
+            - name: modules
+              mountPath: {{ .Values.runtime.path }}
+              readOnly: true
+            {{- end }}
+        {{- if .Values.agones.enabled }}
+        # Kubernetes API access for the allocation module: plain HTTP on localhost, authorised by the service account
+        - name: agones-proxy
+          image: {{ .Values.agones.proxy.image | quote }}
+          imagePullPolicy: IfNotPresent
+          args:
+            - proxy
+            - --address=127.0.0.1
+            - --port={{ .Values.agones.proxy.port }}
+          resources:
+            {{- toYaml .Values.agones.proxy.resources | nindent 12 }}
+        {{- end }}
       volumes:
         - name: config
           configMap:
             name: {{ include "nakama.fullname" . }}-config
+        {{- if .Values.agones.enabled }}
+        - name: modules
+          configMap:
+            name: {{ include "nakama.fullname" . }}-modules
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

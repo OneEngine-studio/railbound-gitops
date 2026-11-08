@@ -1,0 +1,17 @@
+{{- if .Values.autoscaler.enabled }}
+apiVersion: autoscaling.agones.dev/v1
+kind: FleetAutoscaler
+metadata:
+  name: {{ .Values.fleetName }}-autoscaler
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  fleetName: {{ .Values.fleetName }}
+  policy:
+    type: Buffer
+    buffer:
+      bufferSize: {{ .Values.autoscaler.bufferSize }}
+      minReplicas: {{ .Values.autoscaler.minReplicas }}
+      maxReplicas: {{ .Values.autoscaler.maxReplicas }}
+{{- end }}
