@@ -6,6 +6,8 @@ image:
   pullPolicy: IfNotPresent
   tag: "sha-3b0df4db"
 
+# Login for registry.kushanherath.me. The secret is created by hand in the "platform" namespace (never stored in git):
+#   kubectl create secret docker-registry registry-pull -n platform --docker-server=registry.kushanherath.me --docker-username=<user> --docker-******
 imagePullSecrets:
   - name: registry-pull
 nameOverride: ""
