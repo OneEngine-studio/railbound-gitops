@@ -28,11 +28,11 @@ fleet:
   replicas: 0
 
 autoscaler:
-  enabled: false
+  enabled: true
   # keep this many Ready (idle) servers available for the next matches
-  bufferSize: 2
-  minReplicas: 2
-  maxReplicas: 8
+  bufferSize: 1
+  minReplicas: 1
+  maxReplicas: 4
 
 health:
   # the Unity server must report /ready by then and ping /health continuously

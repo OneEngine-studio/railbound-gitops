@@ -1,5 +1,7 @@
 # Default values for game-server.
-replicaCount: 1
+# The old always-on server is replaced by the Agones fleet (charts/agones-fleet). It also held host port 7777, which
+# Agones may hand out from its 7000-8000 range. Set back to 1 only for a direct-connect fallback.
+replicaCount: 0
 
 image:
   repository: registry.kushanherath.me/railbound-server
