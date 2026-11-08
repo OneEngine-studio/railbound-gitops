@@ -6,12 +6,15 @@
 fleetName: railbound-br
 
 image:
-  repository: kushanrandika/railbound-server
+  repository: registry.kushanherath.me/railbound-server
   # the CI bumps this tag on every server build
   tag: "latest"
   pullPolicy: IfNotPresent
 
-imagePullSecrets: []
+# Login for registry.kushanherath.me. The secret is created by hand in the "platform" namespace (never stored in git):
+#   kubectl create secret docker-registry registry-pull -n platform --docker-server=registry.kushanherath.me --docker-username=<user> --docker-password=<password>
+imagePullSecrets:
+  - name: registry-pull
 
 game:
   # port the Unity server listens on INSIDE the container (the Dockerfile starts it with -port 7777).

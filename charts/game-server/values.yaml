@@ -2,11 +2,14 @@
 replicaCount: 1
 
 image:
-  repository: kushanrandika/railbound-server
+  repository: registry.kushanherath.me/railbound-server
   pullPolicy: IfNotPresent
   tag: "latest"
 
-imagePullSecrets: []
+# Login for registry.kushanherath.me. The secret is created by hand in the "platform" namespace (never stored in git):
+#   kubectl create secret docker-registry registry-pull -n platform --docker-server=registry.kushanherath.me --docker-username=<user> --docker-password=<password>
+imagePullSecrets:
+  - name: registry-pull
 nameOverride: ""
 fullnameOverride: ""
 
