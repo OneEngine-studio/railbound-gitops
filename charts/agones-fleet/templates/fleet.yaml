@@ -1,0 +1,54 @@
+apiVersion: agones.dev/v1
+kind: Fleet
+metadata:
+  name: {{ .Values.fleetName }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  {{- if not .Values.autoscaler.enabled }}
+  replicas: {{ .Values.fleet.replicas }}
+  {{- end }}
+  scheduling: Packed
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 25%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ .Chart.Name }}
+    spec:
+      ports:
+        - name: game
+          portPolicy: Dynamic
+          containerPort: {{ .Values.game.containerPort }}
+          protocol: UDP
+      health:
+        initialDelaySeconds: {{ .Values.health.initialDelaySeconds }}
+        periodSeconds: {{ .Values.health.periodSeconds }}
+        failureThreshold: {{ .Values.health.failureThreshold }}
+      template:
+        spec:
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: server
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              env:
+                - name: UNITY_SERVER
+                  value: "1"
+              resources:
+                {{- toYaml .Values.resources | nindent 12 }}
+          {{- with .Values.nodeSelector }}
+          nodeSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.tolerations }}
+          tolerations:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
