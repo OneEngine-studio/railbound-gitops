@@ -8,11 +8,10 @@ fleetName: railbound-br
 image:
   repository: registry.kushanherath.me/railbound-server
   # the CI bumps this tag on every server build
-  tag: "latest"
+  tag: "sha-3b0df4db"
   pullPolicy: IfNotPresent
 
-# Login for registry.kushanherath.me. The secret is created by hand in the "platform" namespace (never stored in git):
-#   kubectl create secret docker-registry registry-pull -n platform --docker-server=registry.kushanherath.me --docker-username=<user> --docker-password=<password>
+# Login for registry.kushanherath.me: secret "registry-pull" in the platform namespace (created by hand, never stored in git).
 imagePullSecrets:
   - name: registry-pull
 
