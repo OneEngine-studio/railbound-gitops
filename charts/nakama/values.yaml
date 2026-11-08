@@ -64,6 +64,29 @@ runtime:
   httpKey: "defaulthttpkey"
   path: "/nakama/data/modules"
 
+# Game server allocation through Agones.
+# Nakama loads files/modules/index.js (RPC "railbound_allocate"). The module talks to the Kubernetes API through a
+# `kubectl proxy` sidecar that runs with this release's service account, which may only create GameServerAllocations
+# in `namespace` (see templates/agones-rbac.yaml).
+agones:
+  enabled: true
+  namespace: platform          # namespace of the Fleet
+  fleet: railbound-br          # Fleet name (charts/agones-fleet)
+  # Address players connect to. Agones reports the node's private address, but players reach the cluster through the
+  # public relay, so this is what the RPC hands out (UDP ports 7000-8000 are forwarded there, see docs).
+  publicHost: "134.185.84.226"
+  proxy:
+    # any image whose entrypoint is kubectl works (for example bitnami/kubectl)
+    image: registry.k8s.io/kubectl:v1.30.5
+    port: 8001
+    resources:
+      requests:
+        cpu: 10m
+        memory: 32Mi
+      limits:
+        cpu: 100m
+        memory: 128Mi
+
 # Matchmaker settings
 matchmaker:
   intervalSec: 15

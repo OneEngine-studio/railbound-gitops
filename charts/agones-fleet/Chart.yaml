@@ -1,0 +1,8 @@
+apiVersion: v2
+name: agones-fleet
+description: Railbound Battle Royale dedicated servers as an Agones Fleet (one server per match, allocated by the Nakama module)
+type: application
+version: 0.1.0
+appVersion: "latest"
+maintainers:
+  - name: OneEngine Studio

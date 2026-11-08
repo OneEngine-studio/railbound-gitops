@@ -38,6 +38,13 @@ data:
     runtime:
       http_key: {{ .Values.runtime.httpKey | quote }}
       path: {{ .Values.runtime.path | quote }}
+      {{- if .Values.agones.enabled }}
+      env:
+        - {{ printf "AGONES_NAMESPACE=%s" .Values.agones.namespace | quote }}
+        - {{ printf "AGONES_FLEET=%s" .Values.agones.fleet | quote }}
+        - {{ printf "AGONES_API=http://127.0.0.1:%v" .Values.agones.proxy.port | quote }}
+        - {{ printf "PUBLIC_GAME_HOST=%s" .Values.agones.publicHost | quote }}
+      {{- end }}
 
     matchmaker:
       interval_sec: {{ .Values.matchmaker.intervalSec }}
