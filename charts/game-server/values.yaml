@@ -6,7 +6,8 @@ image:
   pullPolicy: IfNotPresent
   tag: "sha-3b0df4db"
 
-imagePullSecrets: []
+imagePullSecrets:
+  - name: registry-pull
 nameOverride: ""
 fullnameOverride: ""
 
