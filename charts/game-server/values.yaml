@@ -2,9 +2,9 @@
 replicaCount: 1
 
 image:
-  repository: kushanrandika/railbound-server
+  repository: registry.kushanherath.me/railbound-server
   pullPolicy: IfNotPresent
-  tag: "latest"
+  tag: "sha-3b0df4db"
 
 imagePullSecrets: []
 nameOverride: ""
