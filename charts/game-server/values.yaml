@@ -6,7 +6,7 @@ replicaCount: 0
 image:
   repository: registry.kushanherath.me/railbound-server
   pullPolicy: IfNotPresent
-  tag: "sha-3b0df4db"
+  tag: "sha-daea4c4f"
 
 # Login for registry.kushanherath.me. The secret is created by hand in the "platform" namespace (never stored in git):
 #   kubectl create secret docker-registry registry-pull -n platform --docker-server=registry.kushanherath.me --docker-username=<user> --docker-******
