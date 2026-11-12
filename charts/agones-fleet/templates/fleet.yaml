@@ -9,7 +9,7 @@ spec:
   {{- if not .Values.autoscaler.enabled }}
   replicas: {{ .Values.fleet.replicas }}
   {{- end }}
-  scheduling: Packed
+  scheduling: Distributed
   strategy:
     type: RollingUpdate
     rollingUpdate:
