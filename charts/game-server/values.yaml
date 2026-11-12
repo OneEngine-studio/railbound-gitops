@@ -21,7 +21,7 @@ game:
   protocol: UDP
   hostPort: 7777
   # Public Ingress routing via Oracle Cloud WireGuard bridge
-  publicIP: "134.185.84.226"
+  publicIP: "3.111.144.237"
   wireguardGateway: "10.8.0.1"
   localServerIP: "10.8.0.2"
 
