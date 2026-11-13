@@ -61,8 +61,24 @@ the safety net; take one more immediately before.
 
    (see `docs/backup-and-restore.md`), then scale Nakama up again.
 
-## Optional: rehearse first
+## Rehearsal (done, 2026-11-13)
 
-The upgrade can be tried without touching the live service: deploy Nakama 3.37 with its own throw-away CockroachDB in a separate
-namespace and point a test client at it. That proves the new server starts with this config and module, and accepts a party,
-before the real database is migrated.
+The upgrade was rehearsed in a throw-away namespace with its own CockroachDB (same version, v24.1.0): the **latest real backup was
+restored** into it, then Nakama **3.37.0** ran its `migrate up` on that data with the unchanged production config and module.
+The live services were not touched, and the namespace was deleted afterwards.
+
+| check | result |
+|---|---|
+| restore of the production backup into an empty CockroachDB | succeeded (22 rows, 62 index entries) |
+| `nakama migrate up` from the 3.22 schema | "Successfully applied migration", 7 migrations, about 3.5 s |
+| server start with the production `nakama-config.yml` | started ("Startup done"), no config errors |
+| JavaScript module | loaded, `railbound_allocate` registered |
+| the real guest account (`create=false`) | found after the migration, same user id and name |
+| Unity client session restore against 3.37 | worked (the old session token is still valid) |
+| create a party, join with the code, party data both ways | worked |
+| party leader queues the party, a stranger queues alone | all players matched together, **same derived match id on every client** |
+| lobby: party roster, copy code, leave, join by pasting a code | worked |
+| lobby: leader DEPLOY starts the members' search without a click; a member's own DEPLOY is refused | worked |
+
+Not covered by the rehearsal: `railbound_allocate` itself (the rehearsal server has no Agones access, so only the module load was
+checked) and a full match on a game server. After the real upgrade, deploy once and confirm a game server is allocated.
