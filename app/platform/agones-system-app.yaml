@@ -1,0 +1,37 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: agones-system
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://agones.dev/chart/stable
+    chart: agones
+    targetRevision: 1.62.0
+    helm:
+      values: |
+        agones:
+          allocator:
+            service:
+              serviceType: ClusterIP
+          ping:
+            http:
+              serviceType: ClusterIP
+        gameservers:
+          minPort: 7000
+          maxPort: 8000
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: agones-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

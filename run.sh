@@ -36,16 +36,6 @@
 
 
 
-curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
-
-    helm repo add agones https://agones.dev/chart/stable
-    helm repo update
-
-    helm upgrade --install agones agones/agones \
-      --namespace agones-system \
-      --create-namespace \
-      --kubeconfig /etc/rancher/k3s/k3s.yaml \
-      --set agones.allocator.service.serviceType=ClusterIP \
-      --set agones.ping.http.serviceType=ClusterIP \
-      --set gameservers.minPort=7000 \
-      --set gameservers.maxPort=8000
+# Note: Agones Helm chart is now fully managed declaratively via GitOps
+# (see app/platform/agones-system-app.yaml).
+# You do NOT need to run any manual helm commands!
