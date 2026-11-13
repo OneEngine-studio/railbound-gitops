@@ -55,7 +55,7 @@ backup:
   # Scheduled full backup of the Nakama database to S3 (templates/backup-cronjob.yaml).
   # Turn it on AFTER the infra repo created the bucket and attached the instance profile to the nodes (backups.tf),
   # and the monitoring alerts for it (charts/monitoring-extras, backupAlerts) at the same time.
-  enabled: false
+  enabled: true
   schedule: "0 */6 * * *"
   database: nakama
   bucket: railbound-backups-668602395554-ap-south-1

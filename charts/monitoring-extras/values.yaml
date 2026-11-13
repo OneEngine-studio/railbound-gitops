@@ -39,7 +39,7 @@ alerts:
 # Alerts about the CockroachDB backup CronJob (charts/cockroachdb, backup.enabled). Turn it on together with the backup,
 # otherwise "no successful backup yet" fires.
 backupAlerts:
-  enabled: false
+  enabled: true
   cronJob: cockroachdb-backup
   namespace: platform
   # no successful backup for this long = alert (the schedule runs every 6 hours)
