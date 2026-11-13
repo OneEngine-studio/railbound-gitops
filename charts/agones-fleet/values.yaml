@@ -42,14 +42,20 @@ health:
   failureThreshold: 6
 
 resources:
+  # Measured on the cluster: an idle Ready server uses about 1.7 GiB of memory (and, before the server caps its frame rate,
+  # about 1.2 CPU cores). The old request of 768Mi let the scheduler pack far more servers onto a node than it could hold.
   requests:
     cpu: 250m
-    memory: 768Mi
+    memory: 1536Mi
   limits:
     cpu: 2000m
     memory: 2048Mi
 
-nodeSelector: {}
+# Game servers run on the worker nodes only (they carry the label role=game, set by the infra repo's worker bootstrap).
+# The master (role=core) runs the control plane, Argo CD, CockroachDB and the monitoring; a game server there starved it
+# (master at 86 % memory, API timeouts, restarts).
+nodeSelector:
+  role: game
 tolerations: []
 
 prepull:
