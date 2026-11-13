@@ -51,3 +51,7 @@ resources:
 
 nodeSelector: {}
 tolerations: []
+
+prepull:
+  # keep the game server image on every node (see templates/image-prepull.yaml) so replacement servers start fast
+  enabled: true
