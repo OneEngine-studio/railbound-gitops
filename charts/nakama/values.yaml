@@ -6,7 +6,8 @@ replicaCount: 1
 image:
   repository: heroiclabs/nakama
   pullPolicy: IfNotPresent
-  tag: "3.22.0"
+  # Must match the game client SDK (nakama-unity 3.21.x is built for Nakama 3.36-3.37). 3.28 or newer is required for parties.
+  tag: "3.37.0"
 
 imagePullSecrets: []
 nameOverride: ""
