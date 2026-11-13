@@ -1,0 +1,38 @@
+# Railbound scrape targets, alert rules and the Grafana dashboard (charts/monitoring-extras).
+# Needs the CRDs of the monitoring stack, so it syncs after it and retries until they exist.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring-extras
+  namespace: argocd
+  annotations:
+    argocd.argoproj.io/sync-wave: "6"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/OneEngine-studio/railbound-gitops.git
+    targetRevision: main
+    path: charts/monitoring-extras
+    helm:
+      valueFiles:
+        - values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+      # ServiceMonitor / PrometheusRule do not exist until the stack has installed its CRDs
+      - SkipDryRunOnMissingResource=true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 10m

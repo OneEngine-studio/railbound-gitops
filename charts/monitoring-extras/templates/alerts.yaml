@@ -1,0 +1,89 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: railbound
+  labels:
+    app.kubernetes.io/name: monitoring-extras
+spec:
+  groups:
+    - name: railbound-fleet
+      rules:
+        # The one that matters most: with no Ready server a player who presses DEPLOY waits for a new server to start (about
+        # two minutes), or gets none when the fleet cannot start one.
+        - alert: RailboundNoReadyGameServer
+          expr: agones_fleets_replicas_count{name={{ .Values.fleet.name | quote }}, namespace={{ .Values.fleet.namespace | quote }}, type="ready"} == 0
+          for: {{ .Values.alerts.noReadyServerForMinutes }}m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No Ready game server in fleet {{ .Values.fleet.name }}"
+            description: "The fleet has had no idle game server for {{ .Values.alerts.noReadyServerForMinutes }} minutes. New matches cannot start immediately. Check `kubectl -n {{ .Values.fleet.namespace }} get gameservers` and the image pull / pod status."
+        - alert: RailboundFleetMetricsMissing
+          expr: absent(agones_fleets_replicas_count{name={{ .Values.fleet.name | quote }}, type="ready"})
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No Agones fleet metrics for {{ .Values.fleet.name }}"
+            description: "Prometheus gets no fleet numbers: the Agones controller is down, the fleet was deleted, or the scrape target is broken."
+        - alert: RailboundFleetAtMaxCapacity
+          expr: agones_fleet_autoscalers_limited{fleet_name={{ .Values.fleet.name | quote }}} == 1
+          for: {{ .Values.alerts.fleetAtMaxForMinutes }}m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Fleet {{ .Values.fleet.name }} is at its maximum size"
+            description: "The autoscaler cannot add servers (maxReplicas reached). Raise autoscaler.maxReplicas in charts/agones-fleet or add nodes."
+        - alert: RailboundAgonesTargetDown
+          expr: up{namespace={{ .Values.agones.namespace | quote }}, job=~"agones-.*-metrics-service"} == 0
+          for: 3m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Agones component {{ "{{" }} $labels.job {{ "}}" }} cannot be scraped"
+    - name: railbound-platform
+      rules:
+        - alert: RailboundCockroachDown
+          expr: up{job="cockroachdb"} == 0 or absent(up{job="cockroachdb"})
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "CockroachDB (the Nakama database) is down"
+            description: "Nakama cannot log players in or save profiles while the database is down."
+        - alert: RailboundCockroachDiskLow
+          expr: capacity_available{job="cockroachdb"} / capacity{job="cockroachdb"} < 0.15
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "CockroachDB store has less than 15% free space"
+        - alert: RailboundNodeMemoryHigh
+          expr: (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.92
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Node {{ "{{" }} $labels.instance {{ "}}" }} uses more than 92% of its memory"
+            description: "Game servers on this node may be OOM-killed or evicted."
+{{- if .Values.backupAlerts.enabled }}
+    - name: railbound-backup
+      rules:
+        - alert: RailboundBackupFailed
+          expr: kube_job_status_failed{namespace={{ .Values.backupAlerts.namespace | quote }}, job_name=~"{{ .Values.backupAlerts.cronJob }}-.*"} > 0
+          for: 1m
+          labels:
+            severity: warning
+          annotations:
+            summary: "A CockroachDB backup job failed"
+            description: "Read the job log: `kubectl -n {{ .Values.backupAlerts.namespace }} logs job/{{ "{{" }} $labels.job_name {{ "}}" }}`."
+        - alert: RailboundBackupStale
+          expr: |
+            (time() - kube_cronjob_status_last_successful_time{namespace={{ .Values.backupAlerts.namespace | quote }}, cronjob={{ .Values.backupAlerts.cronJob | quote }}}) > {{ mul .Values.backupAlerts.maxAgeHours 3600 }}
+            or absent(kube_cronjob_status_last_successful_time{namespace={{ .Values.backupAlerts.namespace | quote }}, cronjob={{ .Values.backupAlerts.cronJob | quote }}})
+          for: 30m
+          labels:
+            severity: critical
+          annotations:
+            summary: "No successful CockroachDB backup for {{ .Values.backupAlerts.maxAgeHours }} hours"
+{{- end }}

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: railbound-dashboard
+  labels:
+    # picked up by the Grafana sidecar of the kube-prometheus-stack
+    grafana_dashboard: "1"
+    app.kubernetes.io/name: monitoring-extras
+data:
+  railbound.json: |-
+{{ .Files.Get "dashboards/railbound.json" | indent 4 }}
