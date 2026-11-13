@@ -1,0 +1,46 @@
+# Scrape targets, alerts and dashboard for the Railbound platform. They need the CRDs of the kube-prometheus-stack
+# (app/platform/monitoring-app.yaml), which is installed first.
+
+# Fleet whose Ready (idle) servers the alerts watch
+fleet:
+  name: railbound-br
+  namespace: platform
+
+# Agones exposes Prometheus metrics on separate services (agones-system); `port` is the NAME of the service port.
+agones:
+  namespace: agones-system
+  targets:
+    - name: agones-controller
+      labels:
+        agones.dev/role: controller
+      port: metrics
+    - name: agones-extensions
+      labels:
+        agones.dev/role: extensions
+      port: metrics
+    - name: agones-allocator
+      labels:
+        multicluster.agones.dev/role: allocator
+      port: http
+
+cockroachdb:
+  namespace: platform
+  # label of the Service (charts/cockroachdb) and the name of its HTTP port
+  selector:
+    app.kubernetes.io/name: cockroachdb
+  port: http
+
+alerts:
+  # how long the fleet may have no Ready server before it is critical
+  noReadyServerForMinutes: 2
+  # how long the autoscaler may sit at its maximum before it warns
+  fleetAtMaxForMinutes: 5
+
+# Alerts about the CockroachDB backup CronJob (charts/cockroachdb, backup.enabled). Turn it on together with the backup,
+# otherwise "no successful backup yet" fires.
+backupAlerts:
+  enabled: false
+  cronJob: cockroachdb-backup
+  namespace: platform
+  # no successful backup for this long = alert (the schedule runs every 6 hours)
+  maxAgeHours: 18

@@ -1,0 +1,39 @@
+{{- range .Values.agones.targets }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .name }}
+  labels:
+    app.kubernetes.io/name: monitoring-extras
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ $.Values.agones.namespace }}
+  selector:
+    matchLabels:
+      app: agones
+      {{- toYaml .labels | nindent 6 }}
+  endpoints:
+    - port: {{ .port }}
+      path: /metrics
+      interval: 30s
+{{- end }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cockroachdb
+  labels:
+    app.kubernetes.io/name: monitoring-extras
+spec:
+  namespaceSelector:
+    matchNames:
+      - {{ .Values.cockroachdb.namespace }}
+  selector:
+    matchLabels:
+      {{- toYaml .Values.cockroachdb.selector | nindent 6 }}
+  endpoints:
+    - port: {{ .Values.cockroachdb.port }}
+      path: /_status/vars
+      interval: 30s

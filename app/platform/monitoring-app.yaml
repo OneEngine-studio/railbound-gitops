@@ -1,0 +1,151 @@
+# Prometheus, Alertmanager, Grafana, kube-state-metrics and node-exporter (kube-prometheus-stack).
+#
+# Sized for the 3 small nodes: short retention, small volumes, modest limits. Prometheus keeps 3 days of metrics.
+#
+# BEFORE this can start, create the Grafana admin login once on the master (the password is generated on the node and never
+# stored in git):
+#   kubectl create namespace monitoring
+#   kubectl -n monitoring create secret generic grafana-admin --from-literal=admin-user=admin --from-literal=admin-password="$(openssl rand -hex 16)"
+#   kubectl -n monitoring get secret grafana-admin -o jsonpath='{.data.admin-password}' | base64 -d; echo
+# Until the secret exists the Grafana pod waits (CreateContainerConfigError) and starts by itself once it is there.
+#
+# Open Grafana through an SSH tunnel (nothing is exposed to the internet):
+#   kubectl -n monitoring port-forward svc/kube-prometheus-stack-grafana 3000:80      then http://localhost:3000
+#
+# Alerts fire in Prometheus/Alertmanager from the start; to be notified, add a receiver (see docs/monitoring.md).
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: monitoring-stack
+  namespace: argocd
+  annotations:
+    # last: the platform must not wait for the monitoring to become healthy on a fresh cluster
+    argocd.argoproj.io/sync-wave: "5"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://prometheus-community.github.io/helm-charts
+    chart: kube-prometheus-stack
+    targetRevision: 93.2.2
+    helm:
+      releaseName: kube-prometheus-stack
+      values: |
+        # k3s does not expose these control-plane endpoints; their rules and scrape targets would only be permanent noise
+        kubeEtcd:
+          enabled: false
+        kubeControllerManager:
+          enabled: false
+        kubeScheduler:
+          enabled: false
+        kubeProxy:
+          enabled: false
+        defaultRules:
+          rules:
+            etcd: false
+            kubeControllerManager: false
+            kubeSchedulerAlerting: false
+            kubeSchedulerRecording: false
+            kubeProxy: false
+
+        alertmanager:
+          enabled: true
+          alertmanagerSpec:
+            retention: 72h
+            resources:
+              requests:
+                cpu: 10m
+                memory: 32Mi
+              limits:
+                cpu: 100m
+                memory: 128Mi
+
+        prometheus:
+          prometheusSpec:
+            retention: 3d
+            retentionSize: 4GB
+            # also pick up the ServiceMonitors / rules of other releases (charts/monitoring-extras lives in its own app)
+            serviceMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelectorNilUsesHelmValues: false
+            ruleSelectorNilUsesHelmValues: false
+            resources:
+              requests:
+                cpu: 100m
+                memory: 512Mi
+              limits:
+                cpu: 1000m
+                memory: 1Gi
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 5Gi
+
+        grafana:
+          # the login comes from a Secret created by hand (see the top of this file), never from git
+          admin:
+            existingSecret: grafana-admin
+            userKey: admin-user
+            passwordKey: admin-password
+          persistence:
+            enabled: false
+          sidecar:
+            dashboards:
+              enabled: true
+              label: grafana_dashboard
+              labelValue: "1"
+              searchNamespace: ALL
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 384Mi
+
+        kube-state-metrics:
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+
+        prometheus-node-exporter:
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+
+        prometheusOperator:
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 192Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # the stack's CRDs are too big for client-side apply
+      - ServerSideApply=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m
