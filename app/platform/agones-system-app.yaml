@@ -14,6 +14,9 @@ spec:
     chart: agones
     targetRevision: 1.62.0
     helm:
+      # the cluster bootstrap installed Agones as the Helm release "agones"; Argo must use the same name, otherwise the
+      # immutable Deployment selectors (label release=...) differ and every sync fails
+      releaseName: agones
       values: |
         agones:
           allocator:
