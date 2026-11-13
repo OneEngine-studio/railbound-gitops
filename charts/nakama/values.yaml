@@ -72,9 +72,10 @@ agones:
   enabled: true
   namespace: platform          # namespace of the Fleet
   fleet: railbound-br          # Fleet name (charts/agones-fleet)
-  # Address players connect to. Agones reports the node's private address, but players reach the cluster through the
-  # public relay, so this is what the RPC hands out (UDP ports 7000-8000 are forwarded there, see docs).
-  publicHost: "134.185.84.226"
+  # Address players connect to. Leave it EMPTY on AWS: the RPC then hands out the public address of the node the game
+  # server really runs on (Agones reports the node's external IP, and the fleet spreads servers over all nodes). A fixed
+  # value here sends every player to one node, so servers on the other nodes cannot be reached.
+  publicHost: ""
   proxy:
     # any image whose entrypoint is kubectl works (for example bitnami/kubectl)
     image: registry.k8s.io/kubectl:v1.30.5

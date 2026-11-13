@@ -29,10 +29,11 @@ fleet:
 
 autoscaler:
   enabled: true
-  # keep this many Ready (idle) servers available for the next matches
-  bufferSize: 1
-  minReplicas: 1
-  maxReplicas: 4
+  # keep this many Ready (idle) servers available for the next matches. A replacement server needs ~2 minutes to start
+  # (image pull + Unity boot), so a buffer of 2 keeps players from waiting for it.
+  bufferSize: 2
+  minReplicas: 2
+  maxReplicas: 6
 
 health:
   # the Unity server must report /ready by then and ping /health continuously
