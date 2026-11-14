@@ -8,7 +8,7 @@ fleetName: railbound-br
 image:
   repository: registry.kushanherath.me/railbound-server
   # the CI bumps this tag on every server build
-  tag: "sha-daea4c4f"
+  tag: "sha-900186d6"
   pullPolicy: IfNotPresent
 
 # Login for registry.kushanherath.me: secret "registry-pull" in the platform namespace (created by hand, never stored in git).
