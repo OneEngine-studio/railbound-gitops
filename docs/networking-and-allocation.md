@@ -139,8 +139,10 @@ server; it shuts itself down 120 s later if nobody connects, and the fleet start
   `defaultsigningkey` and the console login `admin / password`. The console is published at `nakama.kushanherath.me`, so
   anybody can open it. Put a Cloudflare Access policy in front of the console and Argo CD hostnames, and move the keys
   and the password into Kubernetes Secrets before the game is public.
-* **Join authorisation.** The server accepts any Netcode client that knows its address. Add connection approval that checks
-  the match id against the player's Nakama session.
+* **Join authorisation** (done, not deployed yet). The server now approves a client only with the match id it was allocated, its Nakama
+  user id and the join ticket `railbound_allocate` returned, checked through `railbound_validate_join` with Nakama's HTTP key.
+  The same HTTP key lets the server report match results (`railbound_report_match`), which is why `runtime.httpKey` must be
+  replaced before this goes live. Deploy order and the Secret to create: `docs/server-authoritative-economy.md` in the Unity repo.
 * **Bots are not networked yet.** See `Assets/Project/Docs/BattleRoyale_Hybrid_MatchLoop_Plan.md` in the Unity repo.
 * **Node address.** Agones reports the node's private address; the allocation module replaces it with `agones.publicHost`
   (`134.185.84.226`). If the relay address ever changes, change that one value.
