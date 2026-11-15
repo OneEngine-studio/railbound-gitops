@@ -62,7 +62,15 @@ session:
 
 # Runtime HTTP API Key
 runtime:
+  # NEVER put the real key here: this repo is public. The value below is Nakama's public default and is only the fallback while
+  # httpKeySecret is empty. The game-server RPCs (railbound_validate_join, railbound_report_match) are only safe with the Secret:
+  #   kubectl -n apps create secret generic railbound-nakama --from-literal=http-key='<long random value>'
+  #   kubectl -n platform create secret generic railbound-nakama --from-literal=http-key='<the same value>'   # read by the game servers
+  # The Nakama pod then starts with --runtime.http_key from that Secret (it overrides this file).
   httpKey: "defaulthttpkey"
+  httpKeySecret:
+    name: railbound-nakama
+    key: http-key
   path: "/nakama/data/modules"
 
 # Game server allocation through Agones.
