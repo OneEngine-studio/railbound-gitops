@@ -42,6 +42,18 @@ spec:
               env:
                 - name: UNITY_SERVER
                   value: "1"
+                # Nakama, for connection approval and match result reporting (see docs/server-authoritative-economy.md).
+                # The HTTP key comes from a Secret created by hand; without it the server refuses every client (it fails closed).
+                - name: RAILBOUND_NAKAMA_URL
+                  value: {{ .Values.nakama.url | quote }}
+                {{- if .Values.nakama.httpKeySecret }}
+                - name: RAILBOUND_NAKAMA_HTTP_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ .Values.nakama.httpKeySecret.name | quote }}
+                      key: {{ .Values.nakama.httpKeySecret.key | quote }}
+                      optional: true
+                {{- end }}
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}
           {{- with .Values.nodeSelector }}

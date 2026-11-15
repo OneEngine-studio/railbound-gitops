@@ -59,7 +59,15 @@ spec:
             - "/bin/sh"
             - "-ecx"
             - |
-              exec /nakama/nakama --config /nakama/config/nakama-config.yml
+              exec /nakama/nakama --config /nakama/config/nakama-config.yml{{- if .Values.runtime.httpKeySecret }} --runtime.http_key "$NAKAMA_HTTP_KEY"{{- end }}
+          {{- if .Values.runtime.httpKeySecret }}
+          env:
+            - name: NAKAMA_HTTP_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.runtime.httpKeySecret.name | quote }}
+                  key: {{ .Values.runtime.httpKeySecret.key | quote }}
+          {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.socket.port }}

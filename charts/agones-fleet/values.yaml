@@ -61,3 +61,14 @@ tolerations: []
 prepull:
   # keep the game server image on every node (see templates/image-prepull.yaml) so replacement servers start fast
   enabled: true
+
+nakama:
+  # How the game server reaches Nakama: it asks Nakama whether a joining player really was sent to this match, and reports each
+  # player's result so Nakama can pay XP and coins. In-cluster address (service "nakama" in namespace apps).
+  url: "http://nakama.apps.svc.cluster.local:7350"
+  # Secret in the "platform" namespace holding Nakama's runtime.http_key. Created by hand, never stored in git:
+  #   kubectl -n platform create secret generic railbound-nakama --from-literal=http-key='<the value of charts/nakama runtime.httpKey>'
+  httpKeySecret:
+    name: railbound-nakama
+    key: http-key
+
