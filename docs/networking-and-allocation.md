@@ -8,13 +8,13 @@ How a player gets from the lobby into a match on the home cluster, and what to s
                               HTTPS / WSS (TCP 443)
   Unity client ───────────────────────────────────────────►  Cloudflare ──► cloudflared (k3s)
         │                                                                          │
-        │  1. matchmaker ticket (socket)                                           ▼
-        │  2. RPC railbound_allocate  ──────────────────────────────►  Nakama (apps/nakama:7350)
+        │  1. RPC railbound_queue_join + join the queue session (socket)          ▼
+        │  2. server countdown, lock, allocation  ◄──────────────────  Nakama (apps/nakama:7350)
         │                                                               │  JS module, kubectl-proxy sidecar
         │                                                               ▼
         │                                                         Agones GameServerAllocation
         │                                                               │  picks a Ready server of Fleet railbound-br
-        │   3. reply: 134.185.84.226 : 7xxx                             ▼
+        │   3. assignment: 134.185.84.226 : 7xxx + join ticket          ▼
         │◄──────────────────────────────────────────────────────  GameServer pod (Unity server, UDP 7777 inside)
         │
         │  4. Netcode for GameObjects, UDP
@@ -125,6 +125,31 @@ curl -s -X POST "$HOST/v2/rpc/railbound_allocate" -H "Authorization: Bearer $TOK
 Expected: `{"payload":"{\"status\":\"ready\",\"host\":\"134.185.84.226\",\"port\":7xxx,...}"}`.
 Repeat with the same `matchId` and you get the same server. `kubectl -n platform get gs` then shows one `Allocated`
 server; it shuts itself down 120 s later if nobody connects, and the fleet starts a replacement.
+
+## Matchmaking (server-authoritative)
+
+Every queue session is an authoritative Nakama match, `railbound_queue` (module: `charts/nakama/files/modules/index.js`).
+Nakama runs one session's joins, leaves and ticks on one thread, so "the countdown ended" and "a player joins" never interleave.
+
+| State | Meaning |
+|---|---|
+| `WAITING` | created, nobody in it yet |
+| `COUNTDOWN` | the first player joined; 30 s on the **server** clock (`runtime.env QUEUE_COUNTDOWN_SECONDS` overrides, 5-120) |
+| `LOCKED` | countdown over or 10 players: roster final, joins refused, label `open: 0` |
+| `STARTING` | a new match id (uuid) is made and a game server allocated for exactly the roster (retried every 2 s, 15 times) |
+| `IN_PROGRESS` | each roster player got its own assignment (address + join ticket); the session ends 20 s later |
+| `COMPLETED` | on the match record, when the game server reports the result (`railbound_report_match`) |
+| `FAILED` | no game server: the players get `servers_busy` and can queue again |
+
+* `railbound_queue_join { mode }` returns the open session of that mode, or creates one. The pointer to the open session is written with
+  its storage version, so two players who arrive together cannot open two sessions that both stay in use.
+* A player is in one session at most (`railbound_queue_user/current`, versioned). Asking again returns the same session; a locked-in
+  player asking again gets its running match back (reconnect); `{ newMatch: true }` always means a new session.
+* A player who arrives after the lock gets the next session. Match ids are never chosen by a client any more:
+  `railbound_allocate` refuses a queue-made match to anybody outside its roster and any match that is `completed`;
+  `railbound_validate_join` refuses both as well.
+* Logs: every transition, roster and assignment is logged with the session id and match id (`kubectl -n apps logs deploy/nakama | grep queue`).
+* Test: `charts/nakama/test/queue-test.js` against a local Nakama (see the header of the file).
 
 ## Match lifecycle on the server
 
