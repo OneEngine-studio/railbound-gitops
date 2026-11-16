@@ -341,6 +341,7 @@ function grantXp(profile, xp, coins) {
   var award = { xp: xp, coins: coins, levelBonusCoins: 0, oldLevel: profile.level, newLevel: profile.level };
   profile.coins += coins;
   profile.totalXp += xp;
+  if (profile.season) { profile.season.xp += xp; }
   if (profile.level < MAX_LEVEL) {
     profile.xp += xp;
     while (profile.level < MAX_LEVEL && profile.xp >= xpForLevel(profile.level)) {
@@ -389,6 +390,7 @@ function mutateProfile(nk, userId, change) {
     rollChallenges(profile, now);
     if (!profile.operators) { profile.operators = []; }
     if (!profile.paid) { profile.paid = []; }
+    normalizeProgression(profile);
 
     var extra = change(profile, now);
     if (extra === null && stored && JSON.stringify(profile) === before) {
@@ -417,7 +419,7 @@ function publicProfile(profile) {
 }
 
 function profileReply(status, profile, extra) {
-  var out = { status: status, profile: publicProfile(profile), prices: OPERATOR_PRICES, serverTime: Date.now() };
+  var out = { status: status, profile: publicProfile(profile), prices: OPERATOR_PRICES, tables: PROGRESSION_TABLES, seasonTier: seasonTier(profile), serverTime: Date.now() };
   if (extra) {
     for (var key in extra) {
       if (Object.prototype.hasOwnProperty.call(extra, key)) {
@@ -539,6 +541,186 @@ function countChallenges(profile, won, kills, survivedSeconds, placement) {
   }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Progression: weapon mastery, the battle royale loadout, ability upgrades and the season battle pass.
+// Every rule lives here; the client gets the tables with the profile and never decides a value.
+//   railbound_set_loadout    player -> starting sidearm / melee / lethal, each gated by player level
+//   railbound_upgrade_skill  player -> next level of Sonar or Medkit for coins (server prices, level gates)
+//   railbound_claim_tier     player -> coins of a reached battle pass tier (once)
+//   railbound_report_match   server -> also { weaponKills: { weaponId: kills } }: XP for the weapons that got the kills
+// ---------------------------------------------------------------------------------------------------------------------
+var WEAPON_DEFS = {
+  p226: "P226", p226dual: "P226 DUAL", ump: "UMP", benelli: "BENELLI M4", m82: "M82",
+  bat: "BASEBALL BAT", katana: "KATANA", grenade: "GRENADE"
+};
+var WEAPON_XP_PER_KILL = 100;
+var WEAPON_MAX_LEVEL = 20;
+
+function xpForWeaponLevel(level) {
+  return 300 + (level - 1) * 150;
+}
+
+// what the player can start a match with; primaries are never chosen (they are loot in a battle royale)
+var LOADOUT_SLOTS = {
+  sidearm: { p226: 1, p226dual: 5 },
+  melee: { none: 1, bat: 1, katana: 3 },
+  lethal: { none: 1, grenade: 8 }
+};
+var DEFAULT_LOADOUT = { sidearm: "p226", melee: "none", lethal: "none" };
+
+// level n of a skill costs costs[n-1] coins and needs player level requiredLevel[n-1]; effects[n] is what that level does
+var SKILL_DEFS = {
+  sonar: {
+    name: "SONAR PULSE", maxLevel: 3, costs: [1000, 2500, 5000], requiredLevel: [2, 6, 12],
+    effects: [
+      { radius: 140, cooldown: 10, charges: 3 }, { radius: 170, cooldown: 9, charges: 3 },
+      { radius: 200, cooldown: 8, charges: 4 }, { radius: 240, cooldown: 7, charges: 5 }
+    ]
+  },
+  medkit: {
+    name: "FIELD MEDKIT", maxLevel: 3, costs: [1000, 2500, 5000], requiredLevel: [3, 8, 15],
+    effects: [
+      { heal: 120, starting: 2, carry: 10 }, { heal: 135, starting: 3, carry: 10 },
+      { heal: 150, starting: 3, carry: 12 }, { heal: 170, starting: 4, carry: 12 }
+    ]
+  }
+};
+
+var BP_TIERS = 40;
+var BP_XP_PER_TIER = 1000;
+
+// free track: coins on even tiers (more on every tenth), a cosmetic preview on odd tiers; premium: previews only (not on sale yet)
+function battlePassRewards() {
+  var cosmetics = ["EMBLEM", "CALLING CARD", "WEAPON CHARM", "OPERATOR LOOK", "STICKER"];
+  var tiers = [];
+  for (var t = 1; t <= BP_TIERS; t++) {
+    var free = t % 2 === 0
+      ? { type: "coins", amount: t % 10 === 0 ? 1000 : 250 }
+      : { type: "cosmetic", kind: cosmetics[(t >> 1) % cosmetics.length], rarity: t % 5 === 0 ? "RARE" : "COMMON" };
+    var premium = { type: "cosmetic", kind: cosmetics[(t + 2) % cosmetics.length], rarity: t % 10 === 0 ? "LEGENDARY" : t % 5 === 0 ? "EPIC" : "RARE" };
+    tiers.push({ tier: t, free: free, premium: premium });
+  }
+  return tiers;
+}
+var BP_REWARDS = battlePassRewards();
+
+var PROGRESSION_TABLES = {
+  weapons: WEAPON_DEFS, weaponXpPerKill: WEAPON_XP_PER_KILL, weaponMaxLevel: WEAPON_MAX_LEVEL,
+  loadoutSlots: LOADOUT_SLOTS, defaultLoadout: DEFAULT_LOADOUT, skills: SKILL_DEFS,
+  season: { id: SEASON_ID, tiers: BP_TIERS, xpPerTier: BP_XP_PER_TIER, rewards: BP_REWARDS }
+};
+
+// fields older profiles do not have yet
+function normalizeProgression(profile) {
+  if (!profile.weapons) { profile.weapons = {}; }
+  if (!profile.loadout) { profile.loadout = { sidearm: DEFAULT_LOADOUT.sidearm, melee: DEFAULT_LOADOUT.melee, lethal: DEFAULT_LOADOUT.lethal }; }
+  if (!profile.skills) { profile.skills = { sonar: 0, medkit: 0 }; }
+  if (!profile.season || profile.season.id !== SEASON_ID) { profile.season = { id: SEASON_ID, xp: 0, claimed: [] }; }
+}
+
+function seasonTier(profile) {
+  return Math.min(BP_TIERS, Math.floor((profile.season ? profile.season.xp : 0) / BP_XP_PER_TIER) + 1);
+}
+
+// weapon XP for kills; returns what changed, for the match result screen
+function grantWeaponKills(profile, weaponKills, maxKills) {
+  var gained = [];
+  if (!weaponKills || typeof weaponKills !== "object") { return gained; }
+  var budget = maxKills;
+  for (var id in weaponKills) {
+    if (!Object.prototype.hasOwnProperty.call(weaponKills, id) || !Object.prototype.hasOwnProperty.call(WEAPON_DEFS, id) || budget <= 0) { continue; }
+    var kills = Math.min(clampInt(weaponKills[id], 0, 100), budget);
+    if (kills <= 0) { continue; }
+    budget -= kills;
+    var w = profile.weapons[id] || { level: 1, xp: 0, kills: 0 };
+    var oldLevel = w.level;
+    w.kills += kills;
+    if (w.level < WEAPON_MAX_LEVEL) {
+      w.xp += kills * WEAPON_XP_PER_KILL;
+      while (w.level < WEAPON_MAX_LEVEL && w.xp >= xpForWeaponLevel(w.level)) {
+        w.xp -= xpForWeaponLevel(w.level);
+        w.level++;
+      }
+      if (w.level >= WEAPON_MAX_LEVEL) { w.xp = 0; }
+    }
+    profile.weapons[id] = w;
+    gained.push({ weapon: id, kills: kills, xp: kills * WEAPON_XP_PER_KILL, oldLevel: oldLevel, newLevel: w.level });
+  }
+  return gained;
+}
+
+function rpcSetLoadout(ctx, logger, nk, payload) {
+  requireUser(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var status = "ok", reason = "";
+  var done = mutateProfile(nk, ctx.userId, function (profile) {
+    status = "ok"; reason = "";
+    normalizeProgression(profile);
+    var next = { sidearm: profile.loadout.sidearm, melee: profile.loadout.melee, lethal: profile.loadout.lethal };
+    for (var slot in LOADOUT_SLOTS) {
+      if (!Object.prototype.hasOwnProperty.call(LOADOUT_SLOTS, slot) || request[slot] === undefined) { continue; }
+      var item = String(request[slot]);
+      var options = LOADOUT_SLOTS[slot];
+      if (!Object.prototype.hasOwnProperty.call(options, item)) { status = "unknown_item"; reason = slot; return null; }
+      if (profile.level < options[item]) { status = "locked"; reason = slot + ":" + options[item]; return null; }
+      next[slot] = item;
+    }
+    if (next.sidearm === profile.loadout.sidearm && next.melee === profile.loadout.melee && next.lethal === profile.loadout.lethal) { return null; }
+    profile.loadout = next;
+    return {};
+  });
+  if (status === "ok") { logger.info("railbound_set_loadout: %s -> %s", ctx.userId, JSON.stringify(done.profile.loadout)); }
+  return profileReply(status, done.profile, reason ? { reason: reason } : null);
+}
+
+function rpcUpgradeSkill(ctx, logger, nk, payload) {
+  requireUser(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var skillId = request.skill ? String(request.skill) : "";
+  if (!Object.prototype.hasOwnProperty.call(SKILL_DEFS, skillId)) {
+    return profileReply("unknown_skill", currentProfile(nk, ctx.userId));
+  }
+  var def = SKILL_DEFS[skillId];
+  var status = "ok", paid = 0;
+  var done = mutateProfile(nk, ctx.userId, function (profile) {
+    status = "ok"; paid = 0;
+    normalizeProgression(profile);
+    var level = profile.skills[skillId] | 0;
+    if (level >= def.maxLevel) { status = "max_level"; return null; }
+    if (profile.level < def.requiredLevel[level]) { status = "locked"; return null; }
+    if (profile.coins < def.costs[level]) { status = "insufficient_coins"; return null; }
+    profile.coins -= def.costs[level];
+    paid = def.costs[level];
+    profile.skills[skillId] = level + 1;
+    return {};
+  });
+  if (status === "ok") { logger.info("railbound_upgrade_skill: %s %s -> level %d for %d coins", ctx.userId, skillId, done.profile.skills[skillId], paid); }
+  return profileReply(status, done.profile);
+}
+
+function rpcClaimTier(ctx, logger, nk, payload) {
+  requireUser(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var tier = request.tier | 0;
+  if (tier < 1 || tier > BP_TIERS) {
+    return profileReply("unknown_tier", currentProfile(nk, ctx.userId));
+  }
+  var reward = BP_REWARDS[tier - 1].free;
+  var status = "ok";
+  var done = mutateProfile(nk, ctx.userId, function (profile) {
+    status = "ok";
+    normalizeProgression(profile);
+    if (reward.type !== "coins") { status = "not_claimable"; return null; }
+    if (seasonTier(profile) < tier) { status = "not_reached"; return null; }
+    if (profile.season.claimed.indexOf(tier) >= 0) { status = "already_claimed"; return null; }
+    profile.season.claimed.push(tier);
+    profile.coins += reward.amount;
+    return {};
+  });
+  if (status === "ok") { logger.info("railbound_claim_tier: %s claimed tier %d (%d coins)", ctx.userId, tier, reward.amount); }
+  return profileReply(status, done.profile, { tier: tier });
+}
+
 // Called by the dedicated game server when a match is over: one entry per human player. The client is never asked.
 // Payload: { matchId, players: [ { userId, placement, totalPlayers, kills, survivedSeconds } ] }
 function rpcReportMatch(ctx, logger, nk, payload) {
@@ -590,10 +772,12 @@ function rpcReportMatch(ctx, logger, nk, payload) {
         countChallenges(profile, won, kills, survived, placement);
 
         var award = grantXp(profile, reward.xp, reward.coins);
+        var weaponAward = grantWeaponKills(profile, entry.weaponKills, kills);
         profile.lastAward = {
           matchId: matchId, xp: award.xp, coins: award.coins, levelBonusCoins: award.levelBonusCoins,
           oldLevel: award.oldLevel, newLevel: award.newLevel,
-          placement: placement, totalPlayers: totalPlayers, kills: kills, survivedSeconds: survived, at: now
+          placement: placement, totalPlayers: totalPlayers, kills: kills, survivedSeconds: survived, at: now,
+          weapons: weaponAward, seasonTier: seasonTier(profile)
         };
         return { award: award };
       });
@@ -937,6 +1121,9 @@ function InitModule(ctx, logger, nk, initializer) {
   initializer.registerRpc("railbound_claim_challenge", rpcClaimChallenge);
   initializer.registerRpc("railbound_report_match", rpcReportMatch);
   initializer.registerRpc("railbound_queue_join", rpcQueueJoin);
+  initializer.registerRpc("railbound_set_loadout", rpcSetLoadout);
+  initializer.registerRpc("railbound_upgrade_skill", rpcUpgradeSkill);
+  initializer.registerRpc("railbound_claim_tier", rpcClaimTier);
   initializer.registerMatch(QUEUE_MODULE, {
     matchInit: queueInit,
     matchJoinAttempt: queueJoinAttempt,
@@ -946,5 +1133,5 @@ function InitModule(ctx, logger, nk, initializer) {
     matchTerminate: queueTerminate,
     matchSignal: queueSignal
   });
-  logger.info("Railbound module loaded: RPCs railbound_allocate, railbound_validate_join, railbound_profile, railbound_buy_operator, railbound_claim_challenge, railbound_report_match, railbound_queue_join and the railbound_queue match handler registered.");
+  logger.info("Railbound module loaded: RPCs railbound_allocate, railbound_validate_join, railbound_profile, railbound_buy_operator, railbound_claim_challenge, railbound_report_match, railbound_queue_join, railbound_set_loadout, railbound_upgrade_skill, railbound_claim_tier and the railbound_queue match handler registered.");
 }
