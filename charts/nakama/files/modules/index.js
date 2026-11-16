@@ -560,6 +560,13 @@ function xpForWeaponLevel(level) {
   return 300 + (level - 1) * 150;
 }
 
+// XP needed to go from level n to n+1, for n = 1 .. max-1 (the client draws the progress bars from it)
+function weaponLevelTable() {
+  var out = [];
+  for (var l = 1; l < WEAPON_MAX_LEVEL; l++) { out.push(xpForWeaponLevel(l)); }
+  return out;
+}
+
 // what the player can start a match with; primaries are never chosen (they are loot in a battle royale)
 var LOADOUT_SLOTS = {
   sidearm: { p226: 1, p226dual: 5 },
@@ -605,7 +612,7 @@ function battlePassRewards() {
 var BP_REWARDS = battlePassRewards();
 
 var PROGRESSION_TABLES = {
-  weapons: WEAPON_DEFS, weaponXpPerKill: WEAPON_XP_PER_KILL, weaponMaxLevel: WEAPON_MAX_LEVEL,
+  weapons: WEAPON_DEFS, weaponXpPerKill: WEAPON_XP_PER_KILL, weaponMaxLevel: WEAPON_MAX_LEVEL, weaponLevelXp: weaponLevelTable(),
   loadoutSlots: LOADOUT_SLOTS, defaultLoadout: DEFAULT_LOADOUT, skills: SKILL_DEFS,
   season: { id: SEASON_ID, tiers: BP_TIERS, xpPerTier: BP_XP_PER_TIER, rewards: BP_REWARDS }
 };
