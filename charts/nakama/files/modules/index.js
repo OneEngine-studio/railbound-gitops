@@ -113,6 +113,13 @@ function rpcAllocate(ctx, logger, nk, payload) {
   var existing = readMatch(nk, matchId);
   if (existing) {
     var value = existing.value || {};
+    if (value.roster && value.roster.indexOf(ctx.userId) < 0) {
+      logger.warn("railbound_allocate: %s is not in the roster of match %s", ctx.userId, matchId);
+      return result("not_in_match", { matchId: matchId });
+    }
+    if (value.status === "completed" || value.status === "failed") {
+      return result("match_over", { matchId: matchId });
+    }
     if (value.status === "ready") {
       return result("ready", { matchId: matchId, host: value.host, port: value.port, name: value.name, token: issueJoinToken(nk, matchId, ctx.userId) });
     }
@@ -209,6 +216,13 @@ function rpcValidateJoin(ctx, logger, nk, payload) {
   }
   if (!join || !join.value || join.value.token !== token) {
     return JSON.stringify({ valid: false, reason: "no_ticket" });
+  }
+  var match = readMatch(nk, matchId);
+  if (match && match.value && (match.value.status === "completed" || match.value.status === "failed")) {
+    return JSON.stringify({ valid: false, reason: "match_over" });
+  }
+  if (match && match.value && match.value.roster && match.value.roster.indexOf(userId) < 0) {
+    return JSON.stringify({ valid: false, reason: "not_in_roster" });
   }
   return JSON.stringify({ valid: true });
 }
@@ -589,8 +603,330 @@ function rpcReportMatch(ctx, logger, nk, payload) {
       results.push({ userId: userId, status: "error" });
     }
   }
+  try {
+    var record = readMatch(nk, matchId);
+    if (record && record.value && record.value.status !== "completed") {
+      record.value.status = "completed";
+      record.value.completedAt = Date.now();
+      writeMatch(nk, matchId, record.value, record.version);
+      logger.info("railbound_report_match: match %s -> COMPLETED", matchId);
+    }
+  } catch (e) {
+    logger.warn("railbound_report_match: could not mark %s completed: %s", matchId, e.message);
+  }
   logger.info("railbound_report_match: match %s, %d player(s) reported", matchId, players.length);
   return JSON.stringify({ status: "ok", results: results });
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Server-authoritative matchmaking queue
+// ---------------------------------------------------------------------------------------------------------------------
+// Every queue session is an AUTHORITATIVE Nakama match ("railbound_queue"). Nakama runs a session's join attempts, joins, leaves and
+// ticks one after the other on one thread, so "the countdown ended" and "a player joins" can never interleave: the roster is locked
+// atomically. Its life:
+//   WAITING      created, nobody in it yet
+//   COUNTDOWN    the first player joined; QUEUE_COUNTDOWN_MS on the SERVER clock (clients only display it)
+//   LOCKED       countdown over (or the session is full): the roster is final, joins are refused, the label says closed
+//   STARTING     a new match id (uuid) is created and a game server is allocated for exactly the locked roster
+//   IN_PROGRESS  every roster member got its own assignment (server address + its own join ticket); the session ends shortly after
+//   COMPLETED    set on the match record when the game server reports the result (railbound_report_match)
+//   FAILED       no game server could be allocated: the players are told and can queue again
+// A player who queues while a session is locking or started gets a NEW session (never an existing match). A player can be in one
+// session only (a per-player record, written with optimistic concurrency). Match ids are made here, never by a client.
+var QUEUE_MODULE = "railbound_queue";
+var QUEUE_OPEN_COLLECTION = "railbound_queue_open";     // system: mode -> the one open session (versioned, so two creators cannot both win)
+var QUEUE_USER_COLLECTION = "railbound_queue_user";     // per player: the session (and later the match) the player is in
+var QUEUE_COUNTDOWN_MS = 30000;
+var QUEUE_MAX_PLAYERS = 10;
+var QUEUE_TICK_RATE = 2;
+var QUEUE_EMPTY_LIFETIME_MS = 60000;                    // a session nobody joined ends after this
+var QUEUE_LINGER_MS = 20000;                            // after the assignment, so a slow client still receives it
+var QUEUE_ALLOC_RETRY_MS = 2000;
+var QUEUE_ALLOC_MAX_ATTEMPTS = 15;
+var QUEUE_RECONNECT_MS = 15 * 60000;                    // a locked-in player may get its assignment again this long after the start
+var OP_QUEUE_STATE = 1, OP_QUEUE_ASSIGNED = 2, OP_QUEUE_FAILED = 3;
+
+// runtime.env QUEUE_COUNTDOWN_SECONDS (5-120) overrides the 30 s countdown (tests, events)
+function queueCountdownMs(ctx) {
+  var seconds = parseInt(envOr(ctx, "QUEUE_COUNTDOWN_SECONDS", ""), 10);
+  return seconds >= 5 && seconds <= 120 ? seconds * 1000 : QUEUE_COUNTDOWN_MS;
+}
+
+function queueModeOf(value) {
+  var mode = value ? String(value).toLowerCase() : "br_solo";
+  return /^[a-z0-9_-]{1,32}$/.test(mode) ? mode : "br_solo";
+}
+
+function queueMemberCount(state) {
+  var n = 0;
+  for (var id in state.members) { if (Object.prototype.hasOwnProperty.call(state.members, id)) { n++; } }
+  return n;
+}
+
+function queueLabel(state) {
+  var open = state.phase === "WAITING" || state.phase === "COUNTDOWN" ? 1 : 0;
+  return JSON.stringify({ mode: state.mode, open: open, phase: state.phase, players: queueMemberCount(state) });
+}
+
+function queueSetPhase(state, logger, dispatcher, phase, why) {
+  if (state.phase === phase) { return; }
+  logger.info("queue %s: %s -> %s (%s) players=%d match=%s", state.sessionId, state.phase, phase, why, queueMemberCount(state), state.gameMatchId || "-");
+  state.phase = phase;
+  if (dispatcher) { dispatcher.matchLabelUpdate(queueLabel(state)); }
+}
+
+function queueBroadcastState(state, dispatcher, now) {
+  var left = state.phase === "COUNTDOWN" ? Math.max(0, Math.ceil((state.countdownEndsAt - now) / 1000)) : 0;
+  dispatcher.broadcastMessage(OP_QUEUE_STATE, JSON.stringify({ sessionId: state.sessionId, phase: state.phase, countdown: left, players: queueMemberCount(state), max: QUEUE_MAX_PLAYERS }), null, null, true);
+}
+
+function readQueueUser(nk, userId) {
+  var objects = nk.storageRead([{ collection: QUEUE_USER_COLLECTION, key: "current", userId: userId }]);
+  return objects && objects.length > 0 ? objects[0] : null;
+}
+
+function clearQueueUser(nk, userId, sessionId) {
+  try {
+    var rec = readQueueUser(nk, userId);
+    if (rec && rec.value && rec.value.sessionId === sessionId && !rec.value.matchId) {
+      nk.storageDelete([{ collection: QUEUE_USER_COLLECTION, key: "current", userId: userId, version: rec.version }]);
+    }
+  } catch (e) { /* another writer won: the record is newer than this session */ }
+}
+
+// is that session still accepting players? (nk.matchGet returns null for a session that ended)
+function queueSessionOpen(nk, sessionId) {
+  if (!sessionId) { return false; }
+  var m = null;
+  try { m = nk.matchGet(sessionId); } catch (e) { return false; }
+  if (!m || !m.label) { return false; }
+  try {
+    var label = JSON.parse(m.label);
+    return label.open === 1 && label.players < QUEUE_MAX_PLAYERS;
+  } catch (e) { return false; }
+}
+
+function queueSessionAlive(nk, sessionId) {
+  try { return !!(sessionId && nk.matchGet(sessionId)); } catch (e) { return false; }
+}
+
+function queueInit(ctx, logger, nk, params) {
+  var now = Date.now();
+  var state = {
+    sessionId: ctx.matchId, mode: queueModeOf(params && params.mode), phase: "WAITING", created: now,
+    countdownEndsAt: 0, members: {}, roster: [], gameMatchId: "", server: null, allocAttempts: 0, nextAllocAt: 0, endAt: 0, lastBroadcast: 0,
+    countdownMs: queueCountdownMs(ctx)
+  };
+  logger.info("queue %s: created for mode %s", ctx.matchId, state.mode);
+  return { state: state, tickRate: QUEUE_TICK_RATE, label: queueLabel(state) };
+}
+
+function queueJoinAttempt(ctx, logger, nk, dispatcher, tick, state, presence, metadata) {
+  var userId = presence.userId;
+  if (state.phase !== "WAITING" && state.phase !== "COUNTDOWN") {
+    // a locked-in player whose connection dropped may come back to receive its assignment; nobody else
+    if (state.members[userId] && (state.phase === "LOCKED" || state.phase === "STARTING" || state.phase === "IN_PROGRESS")) {
+      return { state: state, accept: true };
+    }
+    logger.info("queue %s: refused %s, session is %s", state.sessionId, userId, state.phase);
+    return { state: state, accept: false, rejectMessage: "SESSION_LOCKED" };
+  }
+  if (!state.members[userId] && queueMemberCount(state) >= QUEUE_MAX_PLAYERS) {
+    return { state: state, accept: false, rejectMessage: "SESSION_FULL" };
+  }
+  // one session per player: the per-player record must point here, or be free / stale
+  var rec = null;
+  try { rec = readQueueUser(nk, userId); } catch (e) { rec = null; }
+  if (rec && rec.value && rec.value.sessionId && rec.value.sessionId !== state.sessionId && !rec.value.matchId && queueSessionOpen(nk, rec.value.sessionId)) {
+    logger.info("queue %s: refused %s, already queued in %s", state.sessionId, userId, rec.value.sessionId);
+    return { state: state, accept: false, rejectMessage: "ALREADY_QUEUED" };
+  }
+  if (!rec || !rec.value || rec.value.sessionId !== state.sessionId || rec.value.matchId) {
+    try {
+      nk.storageWrite([{ collection: QUEUE_USER_COLLECTION, key: "current", userId: userId, value: { sessionId: state.sessionId, mode: state.mode, at: Date.now() }, permissionRead: 1, permissionWrite: 0, version: rec ? rec.version : "*" }]);
+    } catch (e) {
+      return { state: state, accept: false, rejectMessage: "RETRY" };   // a concurrent queue request of the same player won
+    }
+  }
+  return { state: state, accept: true };
+}
+
+function queueJoin(ctx, logger, nk, dispatcher, tick, state, presences) {
+  var now = Date.now();
+  for (var i = 0; i < presences.length; i++) {
+    var p = presences[i];
+    var known = state.members[p.userId];
+    if (known) {
+      known.presence = p;   // reconnect of a member (before or after the lock)
+      logger.info("queue %s: %s reconnected", state.sessionId, p.userId);
+      if (state.phase === "IN_PROGRESS" && state.server) {
+        dispatcher.broadcastMessage(OP_QUEUE_ASSIGNED, queueAssignment(nk, state, p.userId), [p], null, true);
+      }
+      continue;
+    }
+    state.members[p.userId] = { presence: p, joinedAt: now };
+    logger.info("queue %s: + %s (%s), players=%d", state.sessionId, p.userId, p.username, queueMemberCount(state));
+  }
+  if (state.phase === "WAITING" && queueMemberCount(state) > 0) {
+    state.countdownEndsAt = now + state.countdownMs;
+    queueSetPhase(state, logger, dispatcher, "COUNTDOWN", "first player");
+  }
+  dispatcher.matchLabelUpdate(queueLabel(state));
+  queueBroadcastState(state, dispatcher, now);
+  return { state: state };
+}
+
+function queueLeave(ctx, logger, nk, dispatcher, tick, state, presences) {
+  for (var i = 0; i < presences.length; i++) {
+    var p = presences[i];
+    var m = state.members[p.userId];
+    if (!m || !m.presence || m.presence.sessionId !== p.sessionId) { continue; }   // an older connection of a player who reconnected
+    if (state.phase === "WAITING" || state.phase === "COUNTDOWN") {
+      delete state.members[p.userId];
+      clearQueueUser(nk, p.userId, state.sessionId);
+      logger.info("queue %s: - %s left before the lock, players=%d", state.sessionId, p.userId, queueMemberCount(state));
+    } else {
+      m.presence = null;   // locked in: keeps the seat; railbound_queue_join gives the assignment back on reconnect
+      logger.info("queue %s: %s disconnected after the lock (keeps the seat in %s)", state.sessionId, p.userId, state.gameMatchId || "-");
+    }
+  }
+  if (dispatcher) { dispatcher.matchLabelUpdate(queueLabel(state)); }
+  return { state: state };
+}
+
+function queueAssignment(nk, state, userId) {
+  return JSON.stringify({ sessionId: state.sessionId, matchId: state.gameMatchId, host: state.server.host, port: state.server.port, name: state.server.name, token: issueJoinToken(nk, state.gameMatchId, userId), players: state.roster.length });
+}
+
+function queueLock(ctx, logger, nk, dispatcher, state, why) {
+  state.roster = [];
+  for (var id in state.members) { if (Object.prototype.hasOwnProperty.call(state.members, id)) { state.roster.push(id); } }
+  state.gameMatchId = nk.uuidv4();
+  queueSetPhase(state, logger, dispatcher, "LOCKED", why);
+  writeMatch(nk, state.gameMatchId, { status: "allocating", at: Date.now(), by: "queue", sessionId: state.sessionId, mode: state.mode, roster: state.roster }, "*");
+  // the per-player records now point at the match: a reconnecting player gets its assignment, a new request opens a new session
+  for (var r = 0; r < state.roster.length; r++) {
+    try {
+      nk.storageWrite([{ collection: QUEUE_USER_COLLECTION, key: "current", userId: state.roster[r], value: { sessionId: state.sessionId, matchId: state.gameMatchId, mode: state.mode, at: Date.now() }, permissionRead: 1, permissionWrite: 0 }]);
+    } catch (e) { logger.warn("queue %s: could not record %s: %s", state.sessionId, state.roster[r], e.message); }
+  }
+  logger.info("queue %s: LOCKED roster=[%s] -> match %s", state.sessionId, state.roster.join(","), state.gameMatchId);
+  queueSetPhase(state, logger, dispatcher, "STARTING", "allocating a game server");
+  state.nextAllocAt = 0;
+}
+
+function queueLoop(ctx, logger, nk, dispatcher, tick, state, messages) {
+  var now = Date.now();
+  var count = queueMemberCount(state);
+
+  if (state.phase === "WAITING" && now - state.created > QUEUE_EMPTY_LIFETIME_MS) {
+    logger.info("queue %s: ended, nobody joined", state.sessionId);
+    return null;
+  }
+  if (state.phase === "COUNTDOWN") {
+    if (count === 0) {
+      logger.info("queue %s: ended, everybody left before the lock", state.sessionId);
+      return null;
+    }
+    if (now >= state.countdownEndsAt) { queueLock(ctx, logger, nk, dispatcher, state, "countdown ended"); }
+    else if (count >= QUEUE_MAX_PLAYERS) { queueLock(ctx, logger, nk, dispatcher, state, "session full"); }
+  }
+  if (state.phase === "STARTING" && now >= state.nextAllocAt) {
+    state.allocAttempts++;
+    var server = null;
+    try { server = allocateGameServer(ctx, nk, state.gameMatchId, state.roster.length); }
+    catch (e) { logger.error("queue %s: allocation attempt %d failed: %s", state.sessionId, state.allocAttempts, e.message); }
+    if (server) {
+      state.server = server;
+      writeMatch(nk, state.gameMatchId, { status: "ready", at: now, startedAt: now, host: server.host, port: server.port, name: server.name, by: "queue", sessionId: state.sessionId, mode: state.mode, roster: state.roster });
+      logger.info("queue %s: match %s -> %s:%d (%s) for %d player(s)", state.sessionId, state.gameMatchId, server.host, server.port, server.name, state.roster.length);
+      for (var i = 0; i < state.roster.length; i++) {
+        var m = state.members[state.roster[i]];
+        if (m && m.presence) {
+          dispatcher.broadcastMessage(OP_QUEUE_ASSIGNED, queueAssignment(nk, state, state.roster[i]), [m.presence], null, true);
+          logger.info("queue %s: assigned %s to match %s", state.sessionId, state.roster[i], state.gameMatchId);
+        }
+      }
+      queueSetPhase(state, logger, dispatcher, "IN_PROGRESS", "assignments sent");
+      state.endAt = now + QUEUE_LINGER_MS;
+    } else if (state.allocAttempts >= QUEUE_ALLOC_MAX_ATTEMPTS) {
+      writeMatch(nk, state.gameMatchId, { status: "failed", at: now, by: "queue", sessionId: state.sessionId, roster: state.roster });
+      for (var f = 0; f < state.roster.length; f++) {
+        try { nk.storageDelete([{ collection: QUEUE_USER_COLLECTION, key: "current", userId: state.roster[f] }]); } catch (e) { }
+      }
+      dispatcher.broadcastMessage(OP_QUEUE_FAILED, JSON.stringify({ sessionId: state.sessionId, matchId: state.gameMatchId, reason: "servers_busy" }), null, null, true);
+      queueSetPhase(state, logger, dispatcher, "FAILED", "no game server after " + state.allocAttempts + " attempts");
+      state.endAt = now + 3000;
+    } else {
+      state.nextAllocAt = now + QUEUE_ALLOC_RETRY_MS;
+    }
+  }
+  if ((state.phase === "IN_PROGRESS" || state.phase === "FAILED") && now >= state.endAt) {
+    logger.info("queue %s: session closed (%s)", state.sessionId, state.phase);
+    return null;
+  }
+  if (now - state.lastBroadcast >= 1000 && count > 0) {
+    state.lastBroadcast = now;
+    queueBroadcastState(state, dispatcher, now);
+  }
+  return { state: state };
+}
+
+function queueTerminate(ctx, logger, nk, dispatcher, tick, state, graceSeconds) {
+  logger.info("queue %s: terminated by the server (phase %s)", state.sessionId, state.phase);
+  return { state: state };
+}
+
+function queueSignal(ctx, logger, nk, dispatcher, tick, state, data) {
+  return { state: state, data: queueLabel(state) };
+}
+
+// Player: put me into a matchmaking session. Payload { mode }. Replies
+//   { status: "queued", sessionId }              join that authoritative match over the socket and wait for its messages
+//   { status: "assigned", matchId, host, ... }   already locked into a running match (reconnect): go to that game server
+function rpcQueueJoin(ctx, logger, nk, payload) {
+  requireUser(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var mode = queueModeOf(request.mode);
+
+  // 1. the player is already in a session, or locked into a match
+  var rec = readQueueUser(nk, ctx.userId);
+  if (rec && rec.value) {
+    if (rec.value.matchId) {
+      var match = readMatch(nk, rec.value.matchId);
+      var mv = match ? match.value : null;
+      var inRoster = mv && mv.roster && mv.roster.indexOf(ctx.userId) >= 0;
+      if (inRoster && mv.status === "ready" && Date.now() - (mv.startedAt || 0) < QUEUE_RECONNECT_MS && !request.newMatch) {
+        logger.info("queue: %s gets its running match %s again (reconnect)", ctx.userId, rec.value.matchId);
+        return result("assigned", { matchId: rec.value.matchId, host: mv.host, port: mv.port, name: mv.name, token: issueJoinToken(nk, rec.value.matchId, ctx.userId), players: mv.roster.length });
+      }
+      if (inRoster && mv.status === "allocating" && queueSessionAlive(nk, rec.value.sessionId)) {
+        return result("queued", { sessionId: rec.value.sessionId, locked: true });   // its session is still allocating: rejoin for the assignment
+      }
+    } else if (rec.value.mode === mode && queueSessionOpen(nk, rec.value.sessionId)) {
+      return result("queued", { sessionId: rec.value.sessionId });
+    }
+  }
+
+  // 2. the open session of this mode, or a new one. The pointer is written with its version: of two players who both find no
+  //    open session and both create one, only one pointer write succeeds; the other player uses the winner's session.
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var objects = nk.storageRead([{ collection: QUEUE_OPEN_COLLECTION, key: mode, userId: SYSTEM_USER }]);
+    var pointer = objects && objects.length > 0 ? objects[0] : null;
+    if (pointer && pointer.value && queueSessionOpen(nk, pointer.value.sessionId)) {
+      return result("queued", { sessionId: pointer.value.sessionId });
+    }
+    var sessionId = nk.matchCreate(QUEUE_MODULE, { mode: mode });
+    try {
+      nk.storageWrite([{ collection: QUEUE_OPEN_COLLECTION, key: mode, userId: SYSTEM_USER, value: { sessionId: sessionId, at: Date.now() }, permissionRead: 0, permissionWrite: 0, version: pointer ? pointer.version : "*" }]);
+      logger.info("queue: %s opened session %s for mode %s", ctx.userId, sessionId, mode);
+      return result("queued", { sessionId: sessionId });
+    } catch (e) {
+      // another request opened a session at the same time: ours stays empty and ends by itself; use theirs
+      logger.info("queue: session %s lost the race for mode %s, retrying", sessionId, mode);
+    }
+  }
+  throw new Error("could not open a matchmaking session");
 }
 
 function InitModule(ctx, logger, nk, initializer) {
@@ -600,5 +936,15 @@ function InitModule(ctx, logger, nk, initializer) {
   initializer.registerRpc("railbound_buy_operator", rpcBuyOperator);
   initializer.registerRpc("railbound_claim_challenge", rpcClaimChallenge);
   initializer.registerRpc("railbound_report_match", rpcReportMatch);
-  logger.info("Railbound module loaded: RPCs railbound_allocate, railbound_validate_join, railbound_profile, railbound_buy_operator, railbound_claim_challenge, railbound_report_match registered.");
+  initializer.registerRpc("railbound_queue_join", rpcQueueJoin);
+  initializer.registerMatch(QUEUE_MODULE, {
+    matchInit: queueInit,
+    matchJoinAttempt: queueJoinAttempt,
+    matchJoin: queueJoin,
+    matchLeave: queueLeave,
+    matchLoop: queueLoop,
+    matchTerminate: queueTerminate,
+    matchSignal: queueSignal
+  });
+  logger.info("Railbound module loaded: RPCs railbound_allocate, railbound_validate_join, railbound_profile, railbound_buy_operator, railbound_claim_challenge, railbound_report_match, railbound_queue_join and the railbound_queue match handler registered.");
 }
