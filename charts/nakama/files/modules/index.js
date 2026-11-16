@@ -625,6 +625,15 @@ function seasonTier(profile) {
 // weapon XP for kills; returns what changed, for the match result screen
 function grantWeaponKills(profile, weaponKills, maxKills) {
   var gained = [];
+  // the game server sends a list [{ weapon, kills }] (Unity's JsonUtility has no dictionaries); a map { id: kills } works too
+  if (weaponKills && Object.prototype.toString.call(weaponKills) === "[object Array]") {
+    var asMap = {};
+    for (var i = 0; i < weaponKills.length; i++) {
+      var e = weaponKills[i] || {};
+      if (e.weapon) { asMap[String(e.weapon)] = (asMap[String(e.weapon)] || 0) + clampInt(e.kills, 0, 100); }
+    }
+    weaponKills = asMap;
+  }
   if (!weaponKills || typeof weaponKills !== "object") { return gained; }
   var budget = maxKills;
   for (var id in weaponKills) {

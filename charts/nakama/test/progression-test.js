@@ -72,6 +72,11 @@ async function playMatch(user, matchId, placement, kills, weaponKills) {
   r = await rpc(A, 'railbound_profile');
   check('a match is paid once (weapon XP too)', r.profile.weapons.ump.kills === 6, r.profile.weapons.ump);
 
+  // the game server's own format: a list of { weapon, kills }
+  rep = await playMatch(A, 'prog-' + tag + '-list', 3, 3, [{ weapon: 'benelli', kills: 2 }, { weapon: 'm82', kills: 1 }]);
+  r = await rpc(A, 'railbound_profile');
+  check('weapon kills sent as a list (the game server format) are paid', r.profile.weapons.benelli && r.profile.weapons.benelli.kills === 2 && r.profile.weapons.m82 && r.profile.weapons.m82.kills === 1, r.profile.weapons);
+
   // ---- battle pass: claim coins of a reached tier, once
   r = await rpc(A, 'railbound_claim_tier', { tier: 2 });
   const coinsAfter = r.profile && r.profile.coins;
