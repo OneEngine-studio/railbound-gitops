@@ -224,7 +224,9 @@ function rpcValidateJoin(ctx, logger, nk, payload) {
   if (match && match.value && match.value.roster && match.value.roster.indexOf(userId) < 0) {
     return JSON.stringify({ valid: false, reason: "not_in_roster" });
   }
-  return JSON.stringify({ valid: true });
+  // the player's team in this match (a party is one team; -1 = a team of one)
+  var t = match && match.value && match.value.teams ? match.value.teams[userId] : null;
+  return JSON.stringify({ valid: true, team: t ? t.team : -1, slot: t ? t.slot : 0 });
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -875,6 +877,7 @@ var NOTE_GIFT = 120;
 var NOTE_ANNOUNCEMENT = 130;
 var NOTE_CHAT_MUTED = 140;
 var NOTE_CHAT_MENTION = 141;
+var NOTE_PARTY_INVITE = 150;
 
 // ---- leaderboards ----
 var LB_PREFIX = "railbound_";
@@ -1434,6 +1437,28 @@ function rpcChatReport(ctx, logger, nk, payload) {
   return result("busy");
 }
 
+// ---- party invites: a friend gets a notification with the party id (Nakama parties have no invites of their own) ----
+var PARTY_INVITE_MAX_PER_MINUTE = 10;
+var PARTY_INVITE_TTL_MS = 10 * 60000;
+
+function rpcPartyInvite(ctx, logger, nk, payload) {
+  requireUser(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var target = String(request.userId || "");
+  var partyId = String(request.partyId || "");
+  if (!target || target === ctx.userId || !partyId || partyId.length > 128) { return result("bad_request"); }
+  if (!isFriend(nk, ctx.userId, target)) { return result("not_friends"); }   // only friends can invite (no spam from strangers)
+  var key = "invites:" + ctx.userId + ":" + Math.floor(Date.now() / 60000);
+  var n = Number(nk.localcacheGet(key) || 0) + 1;
+  nk.localcachePut(key, String(n), 61);
+  if (n > PARTY_INVITE_MAX_PER_MINUTE) { return result("rate_limited"); }
+  var name = ctx.username || "A friend";
+  nk.notificationsSend([{ userId: target, code: NOTE_PARTY_INVITE, persistent: true, senderId: ctx.userId,
+    subject: name + " invited you to their party", content: { partyId: partyId, from: ctx.userId, fromName: name, expiresAt: Date.now() + PARTY_INVITE_TTL_MS } }]);
+  logger.info("party invite: %s -> %s (%s)", ctx.userId, target, partyId);
+  return result("ok");
+}
+
 function rpcChatMute(ctx, logger, nk, payload) {
   requireServerCall(ctx);
   var request = payload ? JSON.parse(payload) : {};
@@ -1472,6 +1497,17 @@ var QUEUE_ALLOC_MAX_ATTEMPTS = 15;
 var QUEUE_RECONNECT_MS = 15 * 60000;                    // a locked-in player may get its assignment again this long after the start
 var OP_QUEUE_STATE = 1, OP_QUEUE_ASSIGNED = 2, OP_QUEUE_FAILED = 3;
 
+// PARTIES: a party queues as one unit. The first member to ask picks a session with free seats for the WHOLE party and reserves them
+// (railbound_queue_party/<party>, written once with its version); every other member asking with the same party id gets that same
+// session. A reservation holds the seats and keeps the countdown from locking the roster before the members have joined. The party
+// becomes one team in the match (railbound_validate_join tells the game server each player's team and slot); a player without a party
+// is a team of one.
+var QUEUE_PARTY_COLLECTION = "railbound_queue_party";
+var QUEUE_PARTY_MAX = 4;
+var QUEUE_PARTY_RECORD_MS = 90000;      // a party record older than this is not used again (the next deploy makes a new one)
+var QUEUE_RESERVE_MS = 20000;           // how long reserved seats wait for the members to join
+var QUEUE_PARTY_MIN_COUNTDOWN_MS = 12000; // a party placed into a running countdown gets at least this long to join
+
 // runtime.env QUEUE_COUNTDOWN_SECONDS (5-120) overrides the 30 s countdown (tests, events)
 function queueCountdownMs(ctx) {
   var seconds = parseInt(envOr(ctx, "QUEUE_COUNTDOWN_SECONDS", ""), 10);
@@ -1489,9 +1525,50 @@ function queueMemberCount(state) {
   return n;
 }
 
+// seats held for party members who have not joined yet (expired reservations are dropped)
+function queueReservedSeats(state, now) {
+  var n = 0;
+  var res = state.reservations || {};
+  for (var key in res) {
+    if (!Object.prototype.hasOwnProperty.call(res, key)) { continue; }
+    if (res[key].until < now) { delete res[key]; continue; }
+    for (var i = 0; i < res[key].members.length; i++) { if (!state.members[res[key].members[i]]) { n++; } }
+  }
+  return n;
+}
+
+function queueReservationOf(state, userId, now) {
+  var res = state.reservations || {};
+  for (var key in res) {
+    if (Object.prototype.hasOwnProperty.call(res, key) && res[key].until >= now && res[key].members.indexOf(userId) >= 0) { return res[key]; }
+  }
+  return null;
+}
+
+// a reservation still waiting for members keeps the roster open (until it expires)
+function queueWaitingForParty(state, now) {
+  var res = state.reservations || {};
+  var until = 0;
+  for (var key in res) {
+    if (!Object.prototype.hasOwnProperty.call(res, key) || res[key].until < now) { continue; }
+    for (var i = 0; i < res[key].members.length; i++) { if (!state.members[res[key].members[i]]) { until = Math.max(until, res[key].until); } }
+  }
+  return until;
+}
+
+function queueTeamsOf(state) {
+  var out = {};
+  for (var i = 0; i < state.roster.length; i++) {
+    var t = state.teams[state.roster[i]];
+    out[state.roster[i]] = t ? { team: t.team, slot: t.slot } : { team: -1, slot: 0 };
+  }
+  return out;
+}
+
 function queueLabel(state) {
   var open = state.phase === "WAITING" || state.phase === "COUNTDOWN" ? 1 : 0;
-  return JSON.stringify({ mode: state.mode, open: open, phase: state.phase, players: queueMemberCount(state) });
+  // "players" counts reserved seats too, so nobody else is sent into seats a party holds
+  return JSON.stringify({ mode: state.mode, open: open, phase: state.phase, players: queueMemberCount(state) + queueReservedSeats(state, Date.now()) });
 }
 
 function queueSetPhase(state, logger, dispatcher, phase, why) {
@@ -1541,7 +1618,8 @@ function queueInit(ctx, logger, nk, params) {
   var state = {
     sessionId: ctx.matchId, mode: queueModeOf(params && params.mode), phase: "WAITING", created: now,
     countdownEndsAt: 0, members: {}, roster: [], gameMatchId: "", server: null, allocAttempts: 0, nextAllocAt: 0, endAt: 0, lastBroadcast: 0,
-    countdownMs: queueCountdownMs(ctx)
+    countdownMs: queueCountdownMs(ctx),
+    reservations: {}, teams: {}, nextTeam: 0
   };
   logger.info("queue %s: created for mode %s", ctx.matchId, state.mode);
   return { state: state, tickRate: QUEUE_TICK_RATE, label: queueLabel(state) };
@@ -1557,7 +1635,9 @@ function queueJoinAttempt(ctx, logger, nk, dispatcher, tick, state, presence, me
     logger.info("queue %s: refused %s, session is %s", state.sessionId, userId, state.phase);
     return { state: state, accept: false, rejectMessage: "SESSION_LOCKED" };
   }
-  if (!state.members[userId] && queueMemberCount(state) >= QUEUE_MAX_PLAYERS) {
+  var nowJoin = Date.now();
+  var reserved = queueReservationOf(state, userId, nowJoin);
+  if (!state.members[userId] && !reserved && queueMemberCount(state) + queueReservedSeats(state, nowJoin) >= QUEUE_MAX_PLAYERS) {
     return { state: state, accept: false, rejectMessage: "SESSION_FULL" };
   }
   // one session per player: the per-player record must point here, or be free / stale
@@ -1591,7 +1671,13 @@ function queueJoin(ctx, logger, nk, dispatcher, tick, state, presences) {
       continue;
     }
     state.members[p.userId] = { presence: p, joinedAt: now };
-    logger.info("queue %s: + %s (%s), players=%d", state.sessionId, p.userId, p.username, queueMemberCount(state));
+    // the team: the party's (slot = order in which its members arrived), or a team of one
+    if (!state.teams[p.userId]) {
+      var r = queueReservationOf(state, p.userId, now);
+      if (r) { state.teams[p.userId] = { team: r.team, slot: r.joined++ }; }
+      else { state.teams[p.userId] = { team: state.nextTeam++, slot: 0 }; }
+    }
+    logger.info("queue %s: + %s (%s), players=%d, team %d", state.sessionId, p.userId, p.username, queueMemberCount(state), state.teams[p.userId].team);
   }
   if (state.phase === "WAITING" && queueMemberCount(state) > 0) {
     state.countdownEndsAt = now + state.countdownMs;
@@ -1629,14 +1715,15 @@ function queueLock(ctx, logger, nk, dispatcher, state, why) {
   for (var id in state.members) { if (Object.prototype.hasOwnProperty.call(state.members, id)) { state.roster.push(id); } }
   state.gameMatchId = nk.uuidv4();
   queueSetPhase(state, logger, dispatcher, "LOCKED", why);
-  writeMatch(nk, state.gameMatchId, { status: "allocating", at: Date.now(), by: "queue", sessionId: state.sessionId, mode: state.mode, roster: state.roster }, "*");
+  state.reservations = {};
+  writeMatch(nk, state.gameMatchId, { status: "allocating", at: Date.now(), by: "queue", sessionId: state.sessionId, mode: state.mode, roster: state.roster, teams: queueTeamsOf(state) }, "*");
   // the per-player records now point at the match: a reconnecting player gets its assignment, a new request opens a new session
   for (var r = 0; r < state.roster.length; r++) {
     try {
       nk.storageWrite([{ collection: QUEUE_USER_COLLECTION, key: "current", userId: state.roster[r], value: { sessionId: state.sessionId, matchId: state.gameMatchId, mode: state.mode, at: Date.now() }, permissionRead: 1, permissionWrite: 0 }]);
     } catch (e) { logger.warn("queue %s: could not record %s: %s", state.sessionId, state.roster[r], e.message); }
   }
-  logger.info("queue %s: LOCKED roster=[%s] -> match %s", state.sessionId, state.roster.join(","), state.gameMatchId);
+  logger.info("queue %s: LOCKED roster=[%s] teams=%s -> match %s", state.sessionId, state.roster.join(","), JSON.stringify(queueTeamsOf(state)), state.gameMatchId);
   queueSetPhase(state, logger, dispatcher, "STARTING", "allocating a game server");
   state.nextAllocAt = 0;
 }
@@ -1654,7 +1741,8 @@ function queueLoop(ctx, logger, nk, dispatcher, tick, state, messages) {
       logger.info("queue %s: ended, everybody left before the lock", state.sessionId);
       return null;
     }
-    if (now >= state.countdownEndsAt) { queueLock(ctx, logger, nk, dispatcher, state, "countdown ended"); }
+    var partyUntil = queueWaitingForParty(state, now);
+    if (now >= state.countdownEndsAt && !partyUntil) { queueLock(ctx, logger, nk, dispatcher, state, "countdown ended"); }
     else if (count >= QUEUE_MAX_PLAYERS) { queueLock(ctx, logger, nk, dispatcher, state, "session full"); }
   }
   if (state.phase === "STARTING" && now >= state.nextAllocAt) {
@@ -1664,7 +1752,7 @@ function queueLoop(ctx, logger, nk, dispatcher, tick, state, messages) {
     catch (e) { logger.error("queue %s: allocation attempt %d failed: %s", state.sessionId, state.allocAttempts, e.message); }
     if (server) {
       state.server = server;
-      writeMatch(nk, state.gameMatchId, { status: "ready", at: now, startedAt: now, host: server.host, port: server.port, name: server.name, by: "queue", sessionId: state.sessionId, mode: state.mode, roster: state.roster });
+      writeMatch(nk, state.gameMatchId, { status: "ready", at: now, startedAt: now, host: server.host, port: server.port, name: server.name, by: "queue", sessionId: state.sessionId, mode: state.mode, roster: state.roster, teams: queueTeamsOf(state) });
       logger.info("queue %s: match %s -> %s:%d (%s) for %d player(s)", state.sessionId, state.gameMatchId, server.host, server.port, server.name, state.roster.length);
       for (var i = 0; i < state.roster.length; i++) {
         var m = state.members[state.roster[i]];
@@ -1704,7 +1792,84 @@ function queueTerminate(ctx, logger, nk, dispatcher, tick, state, graceSeconds) 
 }
 
 function queueSignal(ctx, logger, nk, dispatcher, tick, state, data) {
-  return { state: state, data: queueLabel(state) };
+  var msg = null;
+  try { msg = data ? JSON.parse(data) : null; } catch (e) { msg = null; }
+  if (!msg || msg.op !== "reserve") { return { state: state, data: queueLabel(state) }; }
+  var now = Date.now();
+  if (state.phase !== "WAITING" && state.phase !== "COUNTDOWN") { return { state: state, data: JSON.stringify({ ok: false, reason: "locked" }) }; }
+  var key = String(msg.party || "");
+  if (state.reservations[key]) { return { state: state, data: JSON.stringify({ ok: true, team: state.reservations[key].team }) }; }
+  var members = (msg.members || []).slice(0, QUEUE_PARTY_MAX).map(String);
+  var newSeats = 0;
+  for (var i = 0; i < members.length; i++) { if (!state.members[members[i]]) { newSeats++; } }
+  if (queueMemberCount(state) + queueReservedSeats(state, now) + newSeats > QUEUE_MAX_PLAYERS) {
+    return { state: state, data: JSON.stringify({ ok: false, reason: "full" }) };
+  }
+  var team = state.nextTeam++;
+  state.reservations[key] = { members: members, team: team, until: now + QUEUE_RESERVE_MS, joined: 0 };
+  // members who were already in this session (queued alone first) join the party's team now
+  for (var m = 0; m < members.length; m++) {
+    if (state.members[members[m]]) { state.teams[members[m]] = { team: team, slot: state.reservations[key].joined++ }; }
+  }
+  if (state.phase === "COUNTDOWN" && state.countdownEndsAt - now < QUEUE_PARTY_MIN_COUNTDOWN_MS) { state.countdownEndsAt = now + QUEUE_PARTY_MIN_COUNTDOWN_MS; }
+  logger.info("queue %s: party %s reserved %d seat(s) as team %d", state.sessionId, key, members.length, team);
+  if (dispatcher) { dispatcher.matchLabelUpdate(queueLabel(state)); }
+  return { state: state, data: JSON.stringify({ ok: true, team: team }) };
+}
+
+function queueReserve(nk, logger, sessionId, partyKey, members) {
+  try {
+    var reply = nk.matchSignal(sessionId, JSON.stringify({ op: "reserve", party: partyKey, members: members }));
+    var r = reply ? JSON.parse(reply) : null;
+    return r && r.ok === true;
+  } catch (e) {
+    logger.warn("queue: reserve in %s failed: %s", sessionId, e.message);
+    return false;
+  }
+}
+
+// the party's session: the one recorded for the party, or the open session if it can seat the whole party, or a new one
+function queueJoinParty(ctx, logger, nk, mode, partyKey, party) {
+  var now = Date.now();
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var objects = nk.storageRead([{ collection: QUEUE_PARTY_COLLECTION, key: partyKey, userId: SYSTEM_USER }]);
+    var rec = objects && objects.length > 0 ? objects[0] : null;
+    var v = rec && rec.value ? rec.value : null;
+    if (v && v.mode === mode && now - v.at < QUEUE_PARTY_RECORD_MS && queueSessionOpenOrReserved(nk, v.sessionId)) {
+      if (v.members.indexOf(ctx.userId) >= 0) { return v.sessionId; }
+      return null;   // not a member of the party that queued: queue alone
+    }
+    // pick a session for the whole party
+    var sessionId = null;
+    var pointers = nk.storageRead([{ collection: QUEUE_OPEN_COLLECTION, key: mode, userId: SYSTEM_USER }]);
+    var pointer = pointers && pointers.length > 0 ? pointers[0] : null;
+    if (pointer && pointer.value && queueSessionOpen(nk, pointer.value.sessionId) && queueReserve(nk, logger, pointer.value.sessionId, partyKey, party)) {
+      sessionId = pointer.value.sessionId;
+    } else {
+      sessionId = nk.matchCreate(QUEUE_MODULE, { mode: mode });
+      if (!queueReserve(nk, logger, sessionId, partyKey, party)) { throw new Error("could not reserve seats for the party"); }
+      try {
+        nk.storageWrite([{ collection: QUEUE_OPEN_COLLECTION, key: mode, userId: SYSTEM_USER, value: { sessionId: sessionId, at: now }, permissionRead: 0, permissionWrite: 0, version: pointer ? pointer.version : "*" }]);
+      } catch (e) { /* another session became the open one: this party keeps its own */ }
+    }
+    try {
+      nk.storageWrite([{ collection: QUEUE_PARTY_COLLECTION, key: partyKey, userId: SYSTEM_USER, value: { mode: mode, sessionId: sessionId, members: party, at: now, by: ctx.userId }, permissionRead: 0, permissionWrite: 0, version: rec ? rec.version : "*" }]);
+      logger.info("queue: party %s (%d) -> session %s", partyKey, party.length, sessionId);
+      return sessionId;
+    } catch (e) {
+      logger.info("queue: party %s raced, reading the other member's choice", partyKey);   // another member wrote first: use theirs
+    }
+  }
+  throw new Error("could not place the party");
+}
+
+// open, or locked only by seats a party holds (the label counts reserved seats as players)
+function queueSessionOpenOrReserved(nk, sessionId) {
+  if (!sessionId) { return false; }
+  var m = null;
+  try { m = nk.matchGet(sessionId); } catch (e) { return false; }
+  if (!m || !m.label) { return false; }
+  try { return JSON.parse(m.label).open === 1; } catch (e) { return false; }
 }
 
 // Player: put me into a matchmaking session. Payload { mode }. Replies
@@ -1714,6 +1879,9 @@ function rpcQueueJoin(ctx, logger, nk, payload) {
   requireUser(ctx);
   var request = payload ? JSON.parse(payload) : {};
   var mode = queueModeOf(request.mode);
+  var partyKey = request.partyId ? String(request.partyId).replace(/[^A-Za-z0-9_.-]/g, "-").substring(0, 120) : "";
+  var party = request.party && request.party.length ? request.party.slice(0, QUEUE_PARTY_MAX).map(String) : [];
+  var asParty = partyKey && party.length >= 2 && party.indexOf(ctx.userId) >= 0;
 
   // 1. the player is already in a session, or locked into a match
   var rec = readQueueUser(nk, ctx.userId);
@@ -1729,12 +1897,18 @@ function rpcQueueJoin(ctx, logger, nk, payload) {
       if (inRoster && mv.status === "allocating" && queueSessionAlive(nk, rec.value.sessionId)) {
         return result("queued", { sessionId: rec.value.sessionId, locked: true });   // its session is still allocating: rejoin for the assignment
       }
-    } else if (rec.value.mode === mode && queueSessionOpen(nk, rec.value.sessionId)) {
+    } else if (rec.value.mode === mode && queueSessionOpen(nk, rec.value.sessionId) && !asParty) {
       return result("queued", { sessionId: rec.value.sessionId });
     }
   }
 
-  // 2. the open session of this mode, or a new one. The pointer is written with its version: of two players who both find no
+  // 2. a party: the session the party was placed in (all members together, as one team)
+  if (asParty) {
+    var partySession = queueJoinParty(ctx, logger, nk, mode, partyKey, party);
+    if (partySession) { return result("queued", { sessionId: partySession, party: true }); }
+  }
+
+  // 3. the open session of this mode, or a new one. The pointer is written with its version: of two players who both find no
   //    open session and both create one, only one pointer write succeeds; the other player uses the winner's session.
   for (var attempt = 0; attempt < 4; attempt++) {
     var objects = nk.storageRead([{ collection: QUEUE_OPEN_COLLECTION, key: mode, userId: SYSTEM_USER }]);
@@ -1774,6 +1948,7 @@ function InitModule(ctx, logger, nk, initializer) {
   initializer.registerRpc("railbound_announce", rpcAnnounce);
   initializer.registerRpc("railbound_chat_report", rpcChatReport);
   initializer.registerRpc("railbound_chat_mute", rpcChatMute);
+  initializer.registerRpc("railbound_party_invite", rpcPartyInvite);
   initializer.registerRtBefore("ChannelJoin", beforeChannelJoin);
   initializer.registerRtBefore("ChannelMessageSend", beforeChannelMessageSend);
   initializer.registerLeaderboardReset(onLeaderboardReset);
