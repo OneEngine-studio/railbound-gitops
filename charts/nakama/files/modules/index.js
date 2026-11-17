@@ -411,7 +411,7 @@ function mutateProfile(nk, userId, change) {
 function publicProfile(profile) {
   var out = {};
   for (var key in profile) {
-    if (Object.prototype.hasOwnProperty.call(profile, key) && key !== "paid") {
+    if (Object.prototype.hasOwnProperty.call(profile, key) && key !== "paid" && key !== "lbPaid") {
       out[key] = profile[key];
     }
   }
@@ -737,6 +737,22 @@ function rpcClaimTier(ctx, logger, nk, payload) {
   return profileReply(status, done.profile, { tier: tier });
 }
 
+// leaderboards, notifications and the victory feed for one paid player; failures here never undo the payment
+function afterMatchPaid(nk, logger, userId, extra, kills, profile) {
+  var username = "";
+  try {
+    var users = nk.usersGetId([userId]);
+    username = users && users.length > 0 ? users[0].username : "";
+  } catch (e) {
+    logger.warn("report: no account for %s: %s", userId, e.message);
+  }
+  writeMatchScores(nk, logger, userId, username, extra.level, extra.won, kills, extra.award.xp);
+  matchNotifications(nk, logger, userId, extra.award, extra.oldTier, extra.newTier, profile);
+  if (extra.won && username) {
+    systemChat(nk, logger, "global", username + " won a match with " + kills + " kill" + (kills === 1 ? "" : "s"), "victory");
+  }
+}
+
 // Called by the dedicated game server when a match is over: one entry per human player. The client is never asked.
 // Payload: { matchId, players: [ { userId, placement, totalPlayers, kills, survivedSeconds } ] }
 function rpcReportMatch(ctx, logger, nk, payload) {
@@ -787,6 +803,7 @@ function rpcReportMatch(ctx, logger, nk, payload) {
         if (profile.bestPlacement === 0 || placement < profile.bestPlacement) { profile.bestPlacement = placement; }
         countChallenges(profile, won, kills, survived, placement);
 
+        var oldTier = seasonTier(profile);
         var award = grantXp(profile, reward.xp, reward.coins);
         var weaponAward = grantWeaponKills(profile, entry.weaponKills, kills);
         profile.lastAward = {
@@ -795,8 +812,11 @@ function rpcReportMatch(ctx, logger, nk, payload) {
           placement: placement, totalPlayers: totalPlayers, kills: kills, survivedSeconds: survived, at: now,
           weapons: weaponAward, seasonTier: seasonTier(profile)
         };
-        return { award: award };
+        return { award: award, oldTier: oldTier, newTier: seasonTier(profile), won: won, level: profile.level };
       });
+      if (status === "paid" && done.extra) {
+        afterMatchPaid(nk, logger, userId, done.extra, kills, done.profile);
+      }
       results.push({ userId: userId, status: status, xp: done.extra ? done.extra.award.xp : 0, coins: done.extra ? done.extra.award.coins : 0 });
     } catch (e) {
       logger.error("railbound_report_match: %s in %s: %s", userId, matchId, e.message);
@@ -816,6 +836,612 @@ function rpcReportMatch(ctx, logger, nk, payload) {
   }
   logger.info("railbound_report_match: match %s, %d player(s) reported", matchId, players.length);
   return JSON.stringify({ status: "ok", results: results });
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Social platform: leaderboards, notifications (inbox, gifts, announcements) and chat moderation
+// ---------------------------------------------------------------------------------------------------------------------
+// Everything here is server-authoritative like the economy:
+//   LEADERBOARDS   authoritative boards (a client can never write a score). Scores come ONLY from railbound_report_match (the game
+//                  server). The weekly boards pay their top 3 in coins when they reset (idempotent, with a notification).
+//     railbound_leaderboard        player -> { board?, scope: top | around_me | friends, limit, cursor } (no board: the catalog)
+//     railbound_leaderboard_payout server -> { board, expiry } pays an ENDED period again if the reset hook failed (idempotent)
+//   NOTIFICATIONS  a typed inbox (codes below). Match results, level-ups, weapon level-ups and battle pass tiers are sent by the
+//                  match report; operations send announcements and claimable coin gifts.
+//     railbound_inbox              player -> the persistent notifications, gifts marked claimed / expired
+//     railbound_claim_gift         player -> { giftId } pays a gift once (it must be addressed to the player and not expired)
+//     railbound_send_gift          server -> { giftId, coins, subject, message, userIds? (none = everybody), expiresInHours }
+//     railbound_announce           server -> { subject, message, toChat } to everybody (and the global chat room)
+//   CHAT           Nakama's realtime chat with hooks in front of it: only the rooms in CHAT_ROOMS, direct messages only between
+//                  friends, a rate limit, duplicate spam blocking, a word / link filter, @mentions that notify the player, player
+//                  reports that mute a player automatically, and mutes set by operations.
+//     railbound_chat_report        player -> { channelId, messageId, reason } (the message must exist in that channel)
+//     railbound_chat_mute          server -> { userId, minutes (0 = unmute), reason }
+// "server" RPCs are rejected for any call with a user session: they need the HTTP key, like railbound_report_match.
+
+// A storage value is a Go-backed object in this runtime: an array ASSIGNED to one of its properties is stored as a copy, so a push
+// on that property afterwards is lost. Arrays are therefore built as plain JS arrays and assigned once, after the last change.
+function jsArray(value) {
+  return value ? Array.prototype.slice.call(value) : [];
+}
+
+// ---- notification codes (positive: Nakama reserves the negative ones, e.g. -2 friend request) ----
+var NOTE_MATCH_RESULT = 100;
+var NOTE_LEVEL_UP = 101;
+var NOTE_WEAPON_LEVEL_UP = 102;
+var NOTE_TIER_REACHED = 103;
+var NOTE_LEADERBOARD_REWARD = 110;
+var NOTE_GIFT = 120;
+var NOTE_ANNOUNCEMENT = 130;
+var NOTE_CHAT_MUTED = 140;
+var NOTE_CHAT_MENTION = 141;
+
+// ---- leaderboards ----
+var LB_PREFIX = "railbound_";
+var LEADERBOARDS = {
+  weekly_kills: { title: "WEEKLY KILLS", weekly: true, payouts: [1000, 500, 250] },
+  weekly_wins: { title: "WEEKLY WINS", weekly: true, payouts: [1000, 500, 250] },
+  season_xp: { title: "SEASON XP", weekly: false, payouts: [] },
+  alltime_kills: { title: "ALL-TIME KILLS", weekly: false, payouts: [] }
+};
+var WEEKLY_RESET_CRON = "0 0 * * 1";   // Monday 00:00 UTC (overridable for tests: env LEADERBOARD_WEEKLY_CRON)
+var LB_MAX_LIMIT = 50;
+var MAX_LB_PAID = 30;                   // leaderboard periods a profile remembers having been paid for
+
+function leaderboardId(board) {
+  return board === "season_xp" ? LB_PREFIX + "season_xp_" + SEASON_ID : LB_PREFIX + board;
+}
+
+function boardOfId(id) {
+  for (var b in LEADERBOARDS) {
+    if (Object.prototype.hasOwnProperty.call(LEADERBOARDS, b) && leaderboardId(b) === id) { return b; }
+  }
+  return null;
+}
+
+function createLeaderboards(ctx, logger, nk) {
+  var weeklyCron = envOr(ctx, "LEADERBOARD_WEEKLY_CRON", WEEKLY_RESET_CRON);
+  for (var board in LEADERBOARDS) {
+    if (!Object.prototype.hasOwnProperty.call(LEADERBOARDS, board)) { continue; }
+    var def = LEADERBOARDS[board];
+    try {
+      // authoritative, best first, scores add up; ranks on so the client gets real positions
+      nk.leaderboardCreate(leaderboardId(board), true, "descending", "increment", def.weekly ? weeklyCron : null, { title: def.title }, true);
+    } catch (e) {
+      logger.error("leaderboard %s: %s", board, e.message);
+    }
+  }
+}
+
+// a score for one paid player of a match (called by railbound_report_match; never by a client)
+function writeMatchScores(nk, logger, userId, username, level, won, kills, xp) {
+  var meta = { level: level };
+  var writes = [["alltime_kills", kills], ["weekly_kills", kills], ["weekly_wins", won ? 1 : 0], ["season_xp", xp]];
+  for (var i = 0; i < writes.length; i++) {
+    if (writes[i][1] <= 0) { continue; }
+    try {
+      nk.leaderboardRecordWrite(leaderboardId(writes[i][0]), userId, username, writes[i][1], 0, meta);
+    } catch (e) {
+      logger.warn("leaderboard %s write for %s: %s", writes[i][0], userId, e.message);
+    }
+  }
+}
+
+function recordOut(r, me) {
+  var meta = r.metadata || {};
+  return { rank: r.rank, userId: r.ownerId, username: r.username || "", score: r.score, level: meta.level || 0, isMe: r.ownerId === me };
+}
+
+function rpcLeaderboard(ctx, logger, nk, payload) {
+  requireUser(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  if (!request.board) {
+    var catalog = [];
+    for (var b in LEADERBOARDS) {
+      if (Object.prototype.hasOwnProperty.call(LEADERBOARDS, b)) {
+        catalog.push({ board: b, title: LEADERBOARDS[b].title, weekly: LEADERBOARDS[b].weekly, payouts: LEADERBOARDS[b].payouts });
+      }
+    }
+    return result("ok", { boards: catalog });
+  }
+  var board = String(request.board);
+  if (!LEADERBOARDS[board]) { return result("unknown_board"); }
+  var id = leaderboardId(board);
+  var limit = clampInt(request.limit || 20, 1, LB_MAX_LIMIT);
+  var scope = request.scope || "top";
+  var me = ctx.userId;
+  var records = [];
+  var mine = null;
+  var cursor = "";
+
+  if (scope === "friends") {
+    // the player and their mutual friends (state 0), ranked among themselves
+    var owners = [me];
+    var fl = nk.friendsList(me, 100, 0, "");
+    var friends = fl && fl.friends ? fl.friends : [];
+    for (var f = 0; f < friends.length; f++) {
+      if (friends[f].user && friends[f].user.userId) { owners.push(friends[f].user.userId); }
+    }
+    var listed = nk.leaderboardRecordsList(id, owners, 0, "", 0);
+    var own = listed && listed.ownerRecords ? listed.ownerRecords : [];
+    own.sort(function (a, c) { return c.score - a.score || (a.updateTime < c.updateTime ? -1 : 1); });
+    for (var o = 0; o < own.length && o < limit; o++) {
+      var out = recordOut(own[o], me);
+      out.globalRank = out.rank;
+      out.rank = o + 1;
+      records.push(out);
+      if (out.isMe) { mine = out; }
+    }
+  } else if (scope === "around_me") {
+    var hay = nk.leaderboardRecordsHaystack(id, me, limit, "", 0);
+    var hr = hay && hay.records ? hay.records : [];
+    for (var h = 0; h < hr.length; h++) {
+      var ho = recordOut(hr[h], me);
+      records.push(ho);
+      if (ho.isMe) { mine = ho; }
+    }
+  } else {
+    var top = nk.leaderboardRecordsList(id, [me], limit, request.cursor ? String(request.cursor) : "", 0);
+    var tr = top && top.records ? top.records : [];
+    for (var t = 0; t < tr.length; t++) { records.push(recordOut(tr[t], me)); }
+    if (top && top.ownerRecords && top.ownerRecords.length > 0) { mine = recordOut(top.ownerRecords[0], me); }
+    cursor = top && top.nextCursor ? top.nextCursor : "";
+  }
+  var lb = nk.leaderboardsGetId([id]);
+  var resetsAt = lb && lb.length > 0 && lb[0].nextReset ? lb[0].nextReset : 0;
+  return result("ok", { board: board, title: LEADERBOARDS[board].title, scope: scope, records: records, me: mine, nextCursor: cursor, resetsAt: resetsAt, payouts: LEADERBOARDS[board].payouts });
+}
+
+// pays the top of an ENDED period of a board (its records have expiry == `expiry`). A profile remembers the periods it was paid for,
+// so the reset hook and a manual re-run can never pay twice.
+function payLeaderboardPeriod(logger, nk, board, expiry) {
+  var def = LEADERBOARDS[board];
+  var paid = [];
+  if (!def || !def.payouts || def.payouts.length === 0) { return paid; }
+  var listed = nk.leaderboardRecordsList(leaderboardId(board), [], def.payouts.length, "", expiry);
+  var records = listed && listed.records ? listed.records : [];
+  var key = board + ":" + expiry;
+  for (var i = 0; i < records.length && i < def.payouts.length; i++) {
+    var r = records[i];
+    var coins = def.payouts[i];
+    var rank = i + 1;
+    var status = "paid";
+    try {
+      mutateProfile(nk, r.ownerId, function (profile) {
+        status = "paid";
+        var lbPaid = jsArray(profile.lbPaid);
+        if (lbPaid.indexOf(key) >= 0) { status = "already_paid"; return null; }
+        lbPaid.push(key);
+        while (lbPaid.length > MAX_LB_PAID) { lbPaid.shift(); }
+        profile.lbPaid = lbPaid;
+        profile.coins += coins;
+        return {};
+      });
+      if (status === "paid") {
+        notify(nk, logger, r.ownerId, NOTE_LEADERBOARD_REWARD, "#" + rank + " in " + def.title + ": +" + coins + " coins",
+          { board: board, title: def.title, rank: rank, score: r.score, coins: coins, period: expiry });
+      }
+    } catch (e) {
+      status = "error";
+      logger.error("leaderboard payout %s #%d %s: %s", key, rank, r.ownerId, e.message);
+    }
+    paid.push({ userId: r.ownerId, rank: rank, score: r.score, coins: coins, status: status });
+  }
+  logger.info("leaderboard payout %s: %s", key, JSON.stringify(paid));
+  return paid;
+}
+
+function onLeaderboardReset(ctx, logger, nk, leaderboard, reset) {
+  var board = boardOfId(leaderboard.id);
+  if (board) { payLeaderboardPeriod(logger, nk, board, reset); }
+}
+
+function rpcLeaderboardPayout(ctx, logger, nk, payload) {
+  requireServerCall(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var board = String(request.board || "");
+  var expiry = request.expiry | 0;
+  if (!LEADERBOARDS[board]) { return result("unknown_board"); }
+  if (expiry <= 0 || expiry > Math.floor(Date.now() / 1000)) { return result("period_not_ended"); }
+  return result("ok", { paid: payLeaderboardPeriod(logger, nk, board, expiry) });
+}
+
+// ---- notifications ----
+function notify(nk, logger, userId, code, subject, content) {
+  try {
+    nk.notificationsSend([{ userId: userId, subject: subject, content: content, code: code, persistent: true }]);
+  } catch (e) {
+    logger.warn("notification %d to %s: %s", code, userId, e.message);
+  }
+}
+
+// what one paid match produced, as a few typed notifications (sent after the profile was saved)
+function matchNotifications(nk, logger, userId, award, oldTier, newTier, profile) {
+  var notes = [];
+  var a = profile.lastAward || {};
+  notes.push({ userId: userId, code: NOTE_MATCH_RESULT, persistent: true,
+    subject: a.placement === 1 ? "VICTORY - " + a.kills + " kills" : "#" + a.placement + " of " + a.totalPlayers + " - " + a.kills + " kills",
+    content: { matchId: a.matchId, placement: a.placement, totalPlayers: a.totalPlayers, kills: a.kills, xp: award.xp, coins: award.coins + award.levelBonusCoins } });
+  if (award.newLevel > award.oldLevel) {
+    notes.push({ userId: userId, code: NOTE_LEVEL_UP, persistent: true, subject: "LEVEL " + award.newLevel + " REACHED",
+      content: { oldLevel: award.oldLevel, newLevel: award.newLevel, bonusCoins: award.levelBonusCoins } });
+  }
+  var ups = [];
+  var weapons = a.weapons || [];
+  for (var i = 0; i < weapons.length; i++) {
+    if (weapons[i].newLevel > weapons[i].oldLevel) { ups.push({ weapon: weapons[i].weapon, level: weapons[i].newLevel }); }
+  }
+  if (ups.length > 0) {
+    notes.push({ userId: userId, code: NOTE_WEAPON_LEVEL_UP, persistent: true,
+      subject: ups.length === 1 ? String(WEAPON_DEFS[ups[0].weapon] || ups[0].weapon).toUpperCase() + " LEVEL " + ups[0].level : ups.length + " WEAPONS LEVELED UP",
+      content: { weapons: ups } });
+  }
+  if (newTier > oldTier) {
+    var claimable = [];
+    for (var t = oldTier + 1; t <= newTier; t++) {
+      if (BP_REWARDS[t - 1] && BP_REWARDS[t - 1].free.type === "coins") { claimable.push(t); }
+    }
+    notes.push({ userId: userId, code: NOTE_TIER_REACHED, persistent: true,
+      subject: "BATTLE PASS TIER " + newTier + (claimable.length > 0 ? " - " + claimable.length + " reward(s) to claim" : ""),
+      content: { oldTier: oldTier, newTier: newTier, claimableTiers: claimable } });
+  }
+  try { nk.notificationsSend(notes); } catch (e) { logger.warn("match notifications for %s: %s", userId, e.message); }
+}
+
+var GIFT_COLLECTION = "railbound_gifts";
+var MAX_GIFTS_REMEMBERED = 200;
+var MAX_GIFT_COINS = 10000;
+
+function readGift(nk, giftId) {
+  var objects = nk.storageRead([{ collection: GIFT_COLLECTION, key: giftId, userId: SYSTEM_USER }]);
+  return objects && objects.length > 0 ? objects[0].value : null;
+}
+
+function rpcSendGift(ctx, logger, nk, payload) {
+  requireServerCall(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var giftId = request.giftId ? String(request.giftId) : "";
+  var coins = request.coins | 0;
+  if (!/^[A-Za-z0-9_.-]{3,64}$/.test(giftId) || coins < 1 || coins > MAX_GIFT_COINS) {
+    throw new Error("giftId ([A-Za-z0-9_.-], 3-64) and coins 1-" + MAX_GIFT_COINS + " are required");
+  }
+  var userIds = request.userIds && request.userIds.length ? request.userIds.slice(0, 500).map(String) : null;
+  var hours = clampInt(request.expiresInHours || 168, 1, 24 * 30);
+  var gift = {
+    giftId: giftId, coins: coins, subject: String(request.subject || "A GIFT FROM RAILBOUND").substring(0, 80),
+    message: String(request.message || "").substring(0, 300), audience: userIds ? userIds : "all",
+    createdAt: Date.now(), expiresAt: Date.now() + hours * 3600000
+  };
+  try {
+    // version "*": a gift id can be created once, so a retried send cannot make a second gift
+    nk.storageWrite([{ collection: GIFT_COLLECTION, key: giftId, userId: SYSTEM_USER, value: gift, version: "*", permissionRead: 0, permissionWrite: 0 }]);
+  } catch (e) {
+    return result("exists");
+  }
+  var content = { giftId: giftId, coins: coins, message: gift.message, expiresAt: gift.expiresAt };
+  if (userIds) {
+    var notes = [];
+    for (var i = 0; i < userIds.length; i++) { notes.push({ userId: userIds[i], code: NOTE_GIFT, subject: gift.subject, content: content, persistent: true }); }
+    nk.notificationsSend(notes);
+  } else {
+    nk.notificationSendAll(gift.subject, content, NOTE_GIFT, true);
+  }
+  logger.info("gift %s: %d coins to %s", giftId, coins, userIds ? userIds.length + " player(s)" : "everybody");
+  return result("ok", { gift: gift });
+}
+
+function rpcClaimGift(ctx, logger, nk, payload) {
+  requireUser(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var giftId = request.giftId ? String(request.giftId) : "";
+  var gift = giftId ? readGift(nk, giftId) : null;
+  if (!gift) { return profileReply("unknown_gift", currentProfile(nk, ctx.userId)); }
+  if (Date.now() > gift.expiresAt) { return profileReply("expired", currentProfile(nk, ctx.userId)); }
+  if (gift.audience !== "all" && gift.audience.indexOf(ctx.userId) < 0) { return profileReply("not_eligible", currentProfile(nk, ctx.userId)); }
+  var status = "ok";
+  var done = mutateProfile(nk, ctx.userId, function (profile) {
+    status = "ok";
+    var gifts = jsArray(profile.gifts);
+    if (gifts.indexOf(giftId) >= 0) { status = "already_claimed"; return null; }
+    gifts.push(giftId);
+    while (gifts.length > MAX_GIFTS_REMEMBERED) { gifts.shift(); }
+    profile.gifts = gifts;
+    profile.coins += gift.coins;
+    return {};
+  });
+  if (status === "ok") { logger.info("gift %s claimed by %s (%d coins)", giftId, ctx.userId, gift.coins); }
+  return profileReply(status, done.profile, { giftId: giftId, coins: status === "ok" ? gift.coins : 0 });
+}
+
+// the persistent notifications of the player, newest first, with the state of gifts (claimed / expired) the client cannot know
+function rpcInbox(ctx, logger, nk, payload) {
+  requireUser(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var listed = nk.notificationsList(ctx.userId, clampInt(request.limit || 50, 1, 100), request.cursor ? String(request.cursor) : "");
+  var notes = listed && listed.notifications ? listed.notifications : [];
+  var profile = currentProfile(nk, ctx.userId);
+  var claimedGifts = jsArray(profile.gifts);
+  var now = Date.now();
+  var out = [];
+  var unclaimed = 0;
+  for (var i = 0; i < notes.length; i++) {
+    var n = notes[i];
+    var content = n.content;
+    if (typeof content === "string") { try { content = JSON.parse(content); } catch (e) { content = {}; } }
+    var item = { id: n.id, code: n.code, subject: n.subject, content: content || {}, createTime: n.createTime, senderId: n.senderId || "" };
+    if (n.code === NOTE_GIFT && content && content.giftId) {
+      item.claimed = claimedGifts.indexOf(content.giftId) >= 0;
+      item.expired = content.expiresAt ? now > content.expiresAt : false;
+      if (!item.claimed && !item.expired) { unclaimed++; }
+    }
+    out.push(item);
+  }
+  out.sort(function (a, b) { return a.createTime < b.createTime ? 1 : -1; });
+  return result("ok", { notifications: out, unclaimedGifts: unclaimed, cursor: listed && listed.cacheableCursor ? listed.cacheableCursor : "" });
+}
+
+function rpcAnnounce(ctx, logger, nk, payload) {
+  requireServerCall(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var subject = String(request.subject || "").substring(0, 80);
+  var message = String(request.message || "").substring(0, 300);
+  if (!subject) { throw new Error("subject is required"); }
+  nk.notificationSendAll(subject, { message: message, at: Date.now() }, NOTE_ANNOUNCEMENT, request.persistent !== false);
+  if (request.toChat) { systemChat(nk, logger, "global", subject + (message ? " - " + message : ""), "announcement"); }
+  logger.info("announcement: %s", subject);
+  return result("ok");
+}
+
+// ---- chat ----
+var CHAT_ROOMS = { global: true, lfg: true, help: true };   // the only rooms a player can join
+var CHAT_MAX_LENGTH = 200;
+var CHAT_RATE_COUNT = 5;            // at most this many messages ...
+var CHAT_RATE_WINDOW_S = 10;        // ... in this many seconds
+var CHAT_DUPLICATE_WINDOW_S = 30;   // the same text again within this is spam
+var CHAT_MAX_MENTIONS = 3;
+var CHAT_REPORTS_TO_MUTE = 3;       // distinct players reporting the same player ...
+var CHAT_REPORT_WINDOW_MS = 3600000; // ... within an hour mute them
+var CHAT_AUTO_MUTE_MINUTES = 15;
+var MUTE_COLLECTION = "railbound_chat_mutes";
+var REPORT_COLLECTION = "railbound_chat_reports";
+var SYSTEM_NAME = "RAILBOUND";
+// a short default list; more words come from the env CHAT_BLOCKED_WORDS (comma separated)
+var CHAT_BLOCKED = ["fuck", "fucking", "shit", "bitch", "cunt", "asshole", "bastard", "dick", "pussy", "whore", "slut", "nigger", "faggot", "retard"];
+
+function blockedWords(ctx) {
+  var extra = envOr(ctx, "CHAT_BLOCKED_WORDS", "");
+  return extra ? CHAT_BLOCKED.concat(extra.toLowerCase().split(",").map(function (w) { return w.trim(); }).filter(function (w) { return w.length > 1; })) : CHAT_BLOCKED;
+}
+
+// letters a filter evader swaps in, back to the letters they stand for
+var LEET = { "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s", "!": "i" };
+
+function normalizeWord(word) {
+  var out = "";
+  var w = word.toLowerCase();
+  for (var i = 0; i < w.length; i++) { out += LEET[w.charAt(i)] || w.charAt(i); }
+  return out.replace(/[^a-z]/g, "").replace(/(.)\1{2,}/g, "$1$1");   // "fuuuuck" -> "fuuck"
+}
+
+// returns { text, filtered }: blocked words become stars, links are removed, control characters dropped, whitespace collapsed
+function cleanChat(ctx, text) {
+  var filtered = false;
+  var s = String(text).replace(/[\u0000-\u001f\u007f​-‏‪-‮]/g, "").replace(/\s+/g, " ").trim();
+  var noLinks = s.replace(/\b((https?:\/\/|www\.)\S+|\S+\.(com|net|org|gg|io|ru|xyz|me|tk)(\/\S*)?)\b/gi, "[link removed]");
+  if (noLinks !== s) { filtered = true; s = noLinks; }
+  var words = blockedWords(ctx);
+  var parts = s.split(" ");
+  for (var i = 0; i < parts.length; i++) {
+    var n = normalizeWord(parts[i]);
+    if (!n) { continue; }
+    for (var w = 0; w < words.length; w++) {
+      var bw = words[w];
+      if (n === bw || n === bw + "s" || (bw.length >= 4 && n.indexOf(bw) >= 0) || n.replace(/(.)\1+/g, "$1") === bw.replace(/(.)\1+/g, "$1")) {
+        parts[i] = new Array(parts[i].length + 1).join("*");
+        filtered = true;
+        break;
+      }
+    }
+  }
+  return { text: parts.join(" "), filtered: filtered };
+}
+
+function muteUntil(nk, userId) {
+  var cached = nk.localcacheGet("mute:" + userId);
+  if (cached !== null && cached !== undefined) { return Number(cached) || 0; }
+  var objects = nk.storageRead([{ collection: MUTE_COLLECTION, key: userId, userId: SYSTEM_USER }]);
+  var until = objects && objects.length > 0 && objects[0].value ? objects[0].value.until : 0;
+  if (until && until < Date.now()) { until = 0; }
+  nk.localcachePut("mute:" + userId, until ? String(until) : "0", 30);
+  return until;
+}
+
+function setMute(nk, logger, userId, minutes, reason, by) {
+  var until = minutes > 0 ? Date.now() + minutes * 60000 : 0;
+  nk.storageWrite([{ collection: MUTE_COLLECTION, key: userId, userId: SYSTEM_USER, value: { until: until, reason: reason, by: by, at: Date.now() }, permissionRead: 0, permissionWrite: 0 }]);
+  nk.localcachePut("mute:" + userId, until ? String(until) : "0", 30);
+  if (minutes > 0) {
+    notify(nk, logger, userId, NOTE_CHAT_MUTED, "CHAT MUTED FOR " + minutes + " MIN", { until: until, minutes: minutes, reason: reason });
+  }
+  logger.info("chat mute %s: %d min (%s, by %s)", userId, minutes, reason, by);
+  return until;
+}
+
+// a fixed-window rate limit and the last message, in the node's local cache (shared by every runtime of the node)
+function chatAllowed(nk, userId, text) {
+  var now = Math.floor(Date.now() / 1000);
+  var window = Math.floor(now / CHAT_RATE_WINDOW_S);
+  var rateKey = "chatrate:" + userId + ":" + window;
+  var count = Number(nk.localcacheGet(rateKey) || 0) + 1;
+  nk.localcachePut(rateKey, String(count), CHAT_RATE_WINDOW_S + 1);
+  if (count > CHAT_RATE_COUNT) { return "rate_limited"; }
+  var lastKey = "chatlast:" + userId;
+  var last = nk.localcacheGet(lastKey);
+  var norm = normalizeWord(text) || text.toLowerCase();
+  if (last && last === norm) { return "duplicate"; }
+  nk.localcachePut(lastKey, norm, CHAT_DUPLICATE_WINDOW_S);
+  return null;
+}
+
+function channelMode(channelId) {
+  // Nakama channel ids: "<mode>.<subject>.<subcontext>.<label>", mode 2 = room, 3 = group, 4 = direct message
+  var mode = parseInt(String(channelId || "").split(".")[0], 10);
+  return mode === 2 ? "room" : mode === 3 ? "group" : mode === 4 ? "dm" : "unknown";
+}
+
+function isFriend(nk, userId, otherId) {
+  var cursor = "";
+  for (var page = 0; page < 10; page++) {
+    var fl = nk.friendsList(userId, 100, 0, cursor);
+    var friends = fl && fl.friends ? fl.friends : [];
+    for (var i = 0; i < friends.length; i++) {
+      if (friends[i].user && friends[i].user.userId === otherId) { return true; }
+    }
+    if (!fl || !fl.cursor) { return false; }
+    cursor = fl.cursor;
+  }
+  return false;
+}
+
+function beforeChannelJoin(ctx, logger, nk, envelope) {
+  var join = envelope.channelJoin;
+  if (!join) { return envelope; }
+  var type = join.type | 0;   // 1 room, 2 direct message, 3 group
+  if (type === 1) {
+    var room = String(join.target || "").toLowerCase();
+    if (!CHAT_ROOMS[room]) { throw new Error("unknown chat room"); }
+    join.target = room;
+    join.persistence = true;
+    join.hidden = false;
+  } else if (type === 2) {
+    if (!isFriend(nk, ctx.userId, String(join.target || ""))) { throw new Error("direct messages are only between friends"); }
+    join.persistence = true;
+  }
+  return envelope;   // groups: Nakama checks the membership itself
+}
+
+function beforeChannelMessageSend(ctx, logger, nk, envelope) {
+  var send = envelope.channelMessageSend;
+  if (!send) { return envelope; }
+  var until = muteUntil(nk, ctx.userId);
+  if (until > Date.now()) { throw new Error("muted until " + new Date(until).toISOString()); }
+  var content;
+  try { content = JSON.parse(send.content || "{}"); } catch (e) { throw new Error("message content must be JSON"); }
+  var raw = content && typeof content.message === "string" ? content.message : "";
+  if (!raw.replace(/\s/g, "")) { throw new Error("empty message"); }
+  if (raw.length > CHAT_MAX_LENGTH) { throw new Error("message longer than " + CHAT_MAX_LENGTH + " characters"); }
+  var clean = cleanChat(ctx, raw);
+  var limit = chatAllowed(nk, ctx.userId, clean.text);
+  if (limit === "rate_limited") { throw new Error("slow down: at most " + CHAT_RATE_COUNT + " messages in " + CHAT_RATE_WINDOW_S + " seconds"); }
+  if (limit === "duplicate") { throw new Error("same message sent again"); }
+
+  // only the fields the server knows about go out
+  var out = { message: clean.text };
+  if (clean.filtered) { out.filtered = true; }
+
+  // @mentions in rooms notify the players (not persisted: it is a ping, the message itself is in the room history)
+  if (channelMode(send.channelId) === "room") {
+    var mentions = clean.text.match(/@([A-Za-z0-9_.-]{3,32})/g) || [];
+    var names = [];
+    for (var m = 0; m < mentions.length && names.length < CHAT_MAX_MENTIONS; m++) {
+      var name = mentions[m].substring(1);
+      if (names.indexOf(name) < 0) { names.push(name); }
+    }
+    if (names.length > 0) {
+      try {
+        var users = nk.usersGetUsername(names);
+        var notes = [];
+        for (var u = 0; u < users.length; u++) {
+          if (users[u].userId === ctx.userId) { continue; }
+          notes.push({ userId: users[u].userId, code: NOTE_CHAT_MENTION, persistent: false, senderId: ctx.userId,
+            subject: (ctx.username || "A player") + " mentioned you", content: { channelId: send.channelId, from: ctx.username || "", message: clean.text } });
+        }
+        if (notes.length > 0) { nk.notificationsSend(notes); out.mentions = notes.length; }
+      } catch (e) {
+        logger.warn("chat mentions: %s", e.message);
+      }
+    }
+  }
+  send.content = JSON.stringify(out);
+  return envelope;
+}
+
+function systemChat(nk, logger, room, text, kind) {
+  try {
+    var channelId = nk.channelIdBuild(SYSTEM_USER, room, 1);
+    nk.channelMessageSend(channelId, { message: text, system: true, kind: kind }, SYSTEM_USER, SYSTEM_NAME, true);
+  } catch (e) {
+    logger.warn("system chat %s: %s", room, e.message);
+  }
+}
+
+function rpcChatReport(ctx, logger, nk, payload) {
+  requireUser(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var channelId = String(request.channelId || "");
+  var messageId = String(request.messageId || "");
+  var reason = String(request.reason || "abuse").substring(0, 60);
+  if (!channelId || !messageId) { return result("bad_request"); }
+  // the reported message must really be in that channel (the client cannot blame somebody for a message they never sent)
+  var found = null;
+  try {
+    var history = nk.channelMessagesList(channelId, 100, false, "");
+    var messages = history && history.messages ? history.messages : [];
+    for (var i = 0; i < messages.length; i++) {
+      if (messages[i].messageId === messageId) { found = messages[i]; break; }
+    }
+  } catch (e) {
+    return result("not_found");
+  }
+  if (!found) { return result("not_found"); }
+  var target = found.senderId;
+  if (!target || target === ctx.userId || target === SYSTEM_USER) { return result("not_reportable"); }
+
+  var muted = false;
+  for (var attempt = 0; attempt < 5; attempt++) {
+    var objects = nk.storageRead([{ collection: REPORT_COLLECTION, key: target, userId: SYSTEM_USER }]);
+    var stored = objects && objects.length > 0 ? objects[0] : null;
+    var now = Date.now();
+    var reports = jsArray(stored && stored.value ? stored.value.reports : null).filter(function (x) { return now - x.at < 7 * 24 * 3600000; });
+    var already = false;
+    for (var r = 0; r < reports.length; r++) {
+      if (reports[r].by === ctx.userId && reports[r].messageId === messageId) { already = true; }
+    }
+    if (already) { return result("already_reported"); }
+    var excerpt = "";
+    try { excerpt = String(JSON.parse(found.content).message || "").substring(0, 120); } catch (e) { excerpt = ""; }
+    reports.push({ by: ctx.userId, at: now, messageId: messageId, channelId: channelId, reason: reason, excerpt: excerpt });
+    while (reports.length > 100) { reports.shift(); }
+    try {
+      nk.storageWrite([{ collection: REPORT_COLLECTION, key: target, userId: SYSTEM_USER, value: { reports: reports }, version: stored ? stored.version : "*", permissionRead: 0, permissionWrite: 0 }]);
+    } catch (e) {
+      continue;   // another report was saved in between: read again
+    }
+    // distinct reporters in the last hour
+    var reporters = {};
+    var count = 0;
+    for (var k = 0; k < reports.length; k++) {
+      var rep = reports[k];
+      if (now - rep.at < CHAT_REPORT_WINDOW_MS && !reporters[rep.by]) { reporters[rep.by] = true; count++; }
+    }
+    if (count >= CHAT_REPORTS_TO_MUTE && !(muteUntil(nk, target) > now)) {
+      setMute(nk, logger, target, CHAT_AUTO_MUTE_MINUTES, "reported by " + count + " players", "auto");
+      muted = true;
+    }
+    logger.info("chat report: %s reported %s (%s), %d reporter(s) this hour", ctx.userId, target, reason, count);
+    return result("ok", { autoMuted: muted });
+  }
+  return result("busy");
+}
+
+function rpcChatMute(ctx, logger, nk, payload) {
+  requireServerCall(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var userId = String(request.userId || "");
+  if (!userId) { throw new Error("userId is required"); }
+  var minutes = clampInt(request.minutes, 0, 60 * 24 * 30);
+  var until = setMute(nk, logger, userId, minutes, String(request.reason || "moderator").substring(0, 80), "ops");
+  return result("ok", { until: until });
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1140,6 +1766,18 @@ function InitModule(ctx, logger, nk, initializer) {
   initializer.registerRpc("railbound_set_loadout", rpcSetLoadout);
   initializer.registerRpc("railbound_upgrade_skill", rpcUpgradeSkill);
   initializer.registerRpc("railbound_claim_tier", rpcClaimTier);
+  initializer.registerRpc("railbound_leaderboard", rpcLeaderboard);
+  initializer.registerRpc("railbound_leaderboard_payout", rpcLeaderboardPayout);
+  initializer.registerRpc("railbound_inbox", rpcInbox);
+  initializer.registerRpc("railbound_claim_gift", rpcClaimGift);
+  initializer.registerRpc("railbound_send_gift", rpcSendGift);
+  initializer.registerRpc("railbound_announce", rpcAnnounce);
+  initializer.registerRpc("railbound_chat_report", rpcChatReport);
+  initializer.registerRpc("railbound_chat_mute", rpcChatMute);
+  initializer.registerRtBefore("ChannelJoin", beforeChannelJoin);
+  initializer.registerRtBefore("ChannelMessageSend", beforeChannelMessageSend);
+  initializer.registerLeaderboardReset(onLeaderboardReset);
+  createLeaderboards(ctx, logger, nk);
   initializer.registerMatch(QUEUE_MODULE, {
     matchInit: queueInit,
     matchJoinAttempt: queueJoinAttempt,
@@ -1149,5 +1787,5 @@ function InitModule(ctx, logger, nk, initializer) {
     matchTerminate: queueTerminate,
     matchSignal: queueSignal
   });
-  logger.info("Railbound module loaded: RPCs railbound_allocate, railbound_validate_join, railbound_profile, railbound_buy_operator, railbound_claim_challenge, railbound_report_match, railbound_queue_join, railbound_set_loadout, railbound_upgrade_skill, railbound_claim_tier and the railbound_queue match handler registered.");
+  logger.info("Railbound module loaded: RPCs railbound_allocate, railbound_validate_join, railbound_profile, railbound_buy_operator, railbound_claim_challenge, railbound_report_match, railbound_queue_join, railbound_set_loadout, railbound_upgrade_skill, railbound_claim_tier, the social RPCs (leaderboard, inbox, gifts, announcements, chat moderation), the chat hooks, the leaderboard reset hook and the railbound_queue match handler registered.");
 }
