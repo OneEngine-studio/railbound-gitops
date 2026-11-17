@@ -100,6 +100,22 @@ const team = async (s) => srv('railbound_validate_join', { matchId: s.assigned.m
   await waitFor(() => R1.assigned && R2.assigned, 30000);
   check('the pair plays together', R1.assigned && R2.assigned && R1.assigned.matchId === R2.assigned.matchId, [R1.assigned, R2.assigned]);
 
+  // ---------------------------------------------------------------- 4. party invites (friends only, rate limited)
+  const [I1, I2, I3] = await Promise.all(['I1', 'I2', 'I3'].map(auth));
+  const api = async (u, path) => fetch(`${HOST}${path}`, { method: 'POST', headers: { Authorization: 'Bearer ' + u.token } });
+  await api(I1, `/v2/friend?ids=${I2.uid}`); await api(I2, `/v2/friend?ids=${I1.uid}`);
+  let inv = await rpc(I1, 'railbound_party_invite', { userId: I2.uid, partyId: 'pty-' + tag + '.node' });
+  check('a friend can be invited to a party', inv.status === 'ok', inv);
+  const notes = await (await fetch(`${HOST}/v2/notification?limit=20`, { headers: { Authorization: 'Bearer ' + I2.token } })).json();
+  const n = (notes.notifications || []).find(x => x.code === 150);
+  const nc = n ? JSON.parse(n.content) : {};
+  check('the friend gets the invite with the party id and an expiry', n && nc.partyId === 'pty-' + tag + '.node' && nc.from === I1.uid && nc.expiresAt > Date.now(), n);
+  inv = await rpc(I1, 'railbound_party_invite', { userId: I3.uid, partyId: 'pty-' + tag + '.node' });
+  check('a stranger cannot be invited', inv.status === 'not_friends', inv);
+  let limited = 0;
+  for (let i = 0; i < 12; i++) { const x = await rpc(I1, 'railbound_party_invite', { userId: I2.uid, partyId: 'pty-' + tag + '.node' }); if (x.status === 'rate_limited') limited++; }
+  check('invites are rate limited (10 a minute)', limited >= 2, limited);
+
   for (const s of [A, B, C, D, E, Z, P, Q, R1, R2, ...fillers]) s.ws.close();
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);

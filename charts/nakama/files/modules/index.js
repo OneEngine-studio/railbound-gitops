@@ -877,6 +877,7 @@ var NOTE_GIFT = 120;
 var NOTE_ANNOUNCEMENT = 130;
 var NOTE_CHAT_MUTED = 140;
 var NOTE_CHAT_MENTION = 141;
+var NOTE_PARTY_INVITE = 150;
 
 // ---- leaderboards ----
 var LB_PREFIX = "railbound_";
@@ -1436,6 +1437,28 @@ function rpcChatReport(ctx, logger, nk, payload) {
   return result("busy");
 }
 
+// ---- party invites: a friend gets a notification with the party id (Nakama parties have no invites of their own) ----
+var PARTY_INVITE_MAX_PER_MINUTE = 10;
+var PARTY_INVITE_TTL_MS = 10 * 60000;
+
+function rpcPartyInvite(ctx, logger, nk, payload) {
+  requireUser(ctx);
+  var request = payload ? JSON.parse(payload) : {};
+  var target = String(request.userId || "");
+  var partyId = String(request.partyId || "");
+  if (!target || target === ctx.userId || !partyId || partyId.length > 128) { return result("bad_request"); }
+  if (!isFriend(nk, ctx.userId, target)) { return result("not_friends"); }   // only friends can invite (no spam from strangers)
+  var key = "invites:" + ctx.userId + ":" + Math.floor(Date.now() / 60000);
+  var n = Number(nk.localcacheGet(key) || 0) + 1;
+  nk.localcachePut(key, String(n), 61);
+  if (n > PARTY_INVITE_MAX_PER_MINUTE) { return result("rate_limited"); }
+  var name = ctx.username || "A friend";
+  nk.notificationsSend([{ userId: target, code: NOTE_PARTY_INVITE, persistent: true, senderId: ctx.userId,
+    subject: name + " invited you to their party", content: { partyId: partyId, from: ctx.userId, fromName: name, expiresAt: Date.now() + PARTY_INVITE_TTL_MS } }]);
+  logger.info("party invite: %s -> %s (%s)", ctx.userId, target, partyId);
+  return result("ok");
+}
+
 function rpcChatMute(ctx, logger, nk, payload) {
   requireServerCall(ctx);
   var request = payload ? JSON.parse(payload) : {};
@@ -1925,6 +1948,7 @@ function InitModule(ctx, logger, nk, initializer) {
   initializer.registerRpc("railbound_announce", rpcAnnounce);
   initializer.registerRpc("railbound_chat_report", rpcChatReport);
   initializer.registerRpc("railbound_chat_mute", rpcChatMute);
+  initializer.registerRpc("railbound_party_invite", rpcPartyInvite);
   initializer.registerRtBefore("ChannelJoin", beforeChannelJoin);
   initializer.registerRtBefore("ChannelMessageSend", beforeChannelMessageSend);
   initializer.registerLeaderboardReset(onLeaderboardReset);
