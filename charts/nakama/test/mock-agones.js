@@ -11,7 +11,7 @@ require('http').createServer((req, res) => {
     n++;
     let body = {}; try { body = JSON.parse(b); } catch (e) { }
     const ann = (body.spec && body.spec.metadata && body.spec.metadata.annotations) || {};
-    allocations.push({ name: 'mock-gs-' + n, matchId: ann['railbound.io/match-id'], players: ann['railbound.io/expected-players'] });
+    allocations.push({ name: 'mock-gs-' + n, matchId: ann['railbound.io/match-id'], players: ann['railbound.io/expected-players'], map: ann['railbound.io/map'] || '' });
     res.end(JSON.stringify({ status: { state: 'Allocated', gameServerName: 'mock-gs-' + n, address: '127.0.0.1', ports: [{ name: 'game', port: 7100 + n }] } }));
   });
 }).listen(18001, '0.0.0.0', () => console.log('mock agones on 18001'));
