@@ -64,8 +64,7 @@ function result(status, extra) {
 }
 
 // Asks Agones for a Ready game server of the fleet. Returns { name, host, port } or null when none is Ready.
-// map: the map the players chose ("" = the server's default, MAP-2); the server rebuilds its match on it before anybody joins.
-function allocateGameServer(ctx, nk, matchId, players, map) {
+function allocateGameServer(ctx, nk, matchId, players) {
   var api = envOr(ctx, "AGONES_API", "http://127.0.0.1:8001");
   var namespace = envOr(ctx, "AGONES_NAMESPACE", "platform");
   var fleet = envOr(ctx, "AGONES_FLEET", "railbound-br");
@@ -81,7 +80,6 @@ function allocateGameServer(ctx, nk, matchId, players, map) {
       }
     }
   };
-  if (map) { body.spec.metadata.annotations["railbound.io/map"] = String(map); }
 
   var url = api + "/apis/allocation.agones.dev/v1/namespaces/" + namespace + "/gameserverallocations";
   var response = nk.httpRequest(url, "post", { "Content-Type": "application/json", Accept: "application/json" }, JSON.stringify(body), 8000);
@@ -1516,16 +1514,6 @@ function queueCountdownMs(ctx) {
   return seconds >= 5 && seconds <= 120 ? seconds * 1000 : QUEUE_COUNTDOWN_MS;
 }
 
-// the maps a Classic BR queue can ask for: the queue key is "<mode>_<team>" or "<mode>_<team>-<map>" (no suffix: MAP-2)
-var QUEUE_MAPS = ["railhead", "timberline", "depot9", "foundry", "switchback", "signalhill", "blackwater", "dustfall"];
-
-function queueMapOf(mode) {
-  var i = String(mode || "").lastIndexOf("-");
-  if (i < 0) { return ""; }
-  var map = String(mode).substring(i + 1);
-  return QUEUE_MAPS.indexOf(map) >= 0 ? map : "";
-}
-
 function queueModeOf(value) {
   var mode = value ? String(value).toLowerCase() : "br_solo";
   return /^[a-z0-9_-]{1,32}$/.test(mode) ? mode : "br_solo";
@@ -1760,7 +1748,7 @@ function queueLoop(ctx, logger, nk, dispatcher, tick, state, messages) {
   if (state.phase === "STARTING" && now >= state.nextAllocAt) {
     state.allocAttempts++;
     var server = null;
-    try { server = allocateGameServer(ctx, nk, state.gameMatchId, state.roster.length, queueMapOf(state.mode)); }
+    try { server = allocateGameServer(ctx, nk, state.gameMatchId, state.roster.length); }
     catch (e) { logger.error("queue %s: allocation attempt %d failed: %s", state.sessionId, state.allocAttempts, e.message); }
     if (server) {
       state.server = server;
